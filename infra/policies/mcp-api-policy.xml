@@ -1,0 +1,34 @@
+<policies>
+    <inbound>
+        <base />
+        <set-header name="X-Request-ID" exists-action="skip">
+            <value>@(context.RequestId.ToString())</value>
+        </set-header>
+        <validate-azure-ad-token tenant-id="{{McpTenantId}}"
+            failed-validation-httpcode="401"
+            failed-validation-error-message="Unauthorized">
+            <audiences>
+                <audience>{{McpAudienceAppId}}</audience>
+            </audiences>
+        </validate-azure-ad-token>
+    </inbound>
+    <backend>
+        <base />
+    </backend>
+    <outbound>
+        <base />
+    </outbound>
+    <on-error>
+        <base />
+        <choose>
+            <when condition="@(context.Response.StatusCode == 401)">
+                <return-response>
+                    <set-status code="401" reason="Unauthorized" />
+                    <set-header name="WWW-Authenticate" exists-action="override">
+                        <value>Bearer error="invalid_token", resource_metadata="{{APIMGatewayURL}}/orders-mcp/.well-known/oauth-protected-resource"</value>
+                    </set-header>
+                </return-response>
+            </when>
+        </choose>
+    </on-error>
+</policies>

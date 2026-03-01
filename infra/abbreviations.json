@@ -1,0 +1,13 @@
+{
+  "appContainerApps": "ca-",
+  "appManagedEnvironments": "cae-",
+  "cognitiveServicesAccounts": "aoai-",
+  "containerRegistryRegistries": "acr",
+  "insightsComponents": "appi-",
+  "keyVaultVaults": "kv-",
+  "machineLearningServicesWorkspaces": "ai-",
+  "apiManagementService": "apim-",
+  "operationalInsightsWorkspaces": "log-",
+  "resourcesResourceGroups": "rg-",
+  "storageStorageAccounts": "st"
+}
