@@ -188,9 +188,9 @@ def print_signin_table(events: list, app_name: str):
         return
 
     print(f"\n  {BOLD}{app_name}{RESET} — {len(events)} event(s):")
-    print(f"  {'─' * 110}")
+    print(f"  {'-' * 110}")
     print(f"  {'Timestamp':<24} {'User':<25} {'Resource':<25} {'Status':<12} {'IP':<16} {'CA Status'}")
-    print(f"  {'─' * 110}")
+    print(f"  {'-' * 110}")
 
     for event in events:
         ts = format_timestamp(event.get("createdDateTime", ""))
