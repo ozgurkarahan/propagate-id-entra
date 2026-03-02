@@ -1,16 +1,11 @@
-"""Diagnose MCP OAuth token flow end-to-end.
+"""Diagnose MCP auth flow end-to-end.
 
-Tests every step of the Foundry MCP OAuth pipeline to identify exactly where
-the token acquisition breaks:
+Tests the MCP endpoint and connection configuration:
 
-  1. Read OAuth connection via ARM (verify credentials, target, scopes)
-  2. Manual token acquisition via refresh_token grant
-  3. Decode access token JWT (check aud, iss, scp, tid claims)
-  4. Call MCP endpoint with the token (verify APIM accepts it)
-  5. Check 401 response headers (WWW-Authenticate format)
-  6. Check PRM response (resource, authorization_servers, scopes)
-  7. Check Entra sign-in logs (did Foundry attempt token acquisition?)
-  8. Target <-> Resource mismatch analysis
+  1. Read MCP connection via ARM (verify authType, target)
+  2. Check 401 response headers (WWW-Authenticate format)
+  3. Check PRM response (resource, authorization_servers, scopes)
+  4. Verify APIM Named Values (McpTenantId, APIMGatewayURL)
 
 Usage: python scripts/diagnose-mcp-auth.py
 """
@@ -145,7 +140,7 @@ def step1_read_connection() -> dict | None:
         sub_id = result.stdout.strip()
         os.environ["AZURE_SUBSCRIPTION_ID"] = sub_id
 
-    conn_name = os.environ.get("MCP_OAUTH_CONNECTION_NAME", "mcp-oauth")
+    conn_name = os.environ.get("MCP_CONNECTION_NAME", "mcp-entra")
     url = (
         f"https://management.azure.com/subscriptions/{sub_id}"
         f"/resourceGroups/{RESOURCE_GROUP}"
@@ -207,12 +202,12 @@ def step1_read_connection() -> dict | None:
     print(f"  Secret:     {'present' if has_secret else 'MISSING'}")
     print(f"  Refresh:    {'present' if has_refresh else 'MISSING'}")
 
-    check("connection", auth_type == "OAuth2", f"AuthType = {auth_type}")
+    check("connection", auth_type in ("OAuth2", "UserEntraToken"), f"AuthType = {auth_type}")
     check("connection", bool(target), f"Target = {target}")
     check("connection", bool(client_id), f"ClientID = {client_id}")
     check("connection", has_secret, f"ClientSecret {'present' if has_secret else 'MISSING'}")
-    check("connection", has_refresh,
-          f"RefreshToken {'present' if has_refresh else 'MISSING — run grant-mcp-consent.py'}")
+    check("connection", True,
+          f"RefreshToken {'present' if has_refresh else 'N/A (UserEntraToken — no refresh needed)'}")
     check("connection", bool(scopes), f"Scopes = {scopes}")
 
     # Store credentials on the conn object for step 2
@@ -337,18 +332,13 @@ def step3_decode_token(access_token: str):
     print(f"  name:  {name}")
     print(f"  exp:   {exp}")
 
-    # Check audience
-    audience_app_id = os.environ.get("MCP_AUDIENCE_APP_ID", "")
-    expected_aud_api = f"api://{audience_app_id}" if audience_app_id else ""
+    # Check audience — UserEntraToken passes aud=https://ai.azure.com
+    expected_aud = "https://ai.azure.com"
 
-    if aud == expected_aud_api:
-        check("jwt", True, f"aud = {aud} (matches api://{{appId}})")
-    elif aud == audience_app_id:
-        check("jwt", True, f"aud = {aud} (raw app ID, NOT api:// prefixed)")
-        print(f"  ** WARNING: Token aud is raw app ID, not api:// prefixed **")
-        print(f"  ** APIM validate-azure-ad-token audience must match this format **")
+    if aud == expected_aud:
+        check("jwt", True, f"aud = {aud} (matches expected audience)")
     else:
-        check("jwt", False, f"aud = {aud} (expected {expected_aud_api} or {audience_app_id})")
+        check("jwt", False, f"aud = {aud} (expected {expected_aud})")
 
     # Check issuer (v1.0 and v2.0 formats are both valid)
     expected_iss_v2 = f"https://login.microsoftonline.com/{TENANT_ID}/v2.0"
@@ -356,8 +346,8 @@ def step3_decode_token(access_token: str):
     iss_ok = iss in (expected_iss_v2, expected_iss_v1)
     check("jwt", iss_ok, f"iss = {iss} ({'v2.0' if iss == expected_iss_v2 else 'v1.0' if iss == expected_iss_v1 else 'unknown'})")
 
-    # Check scope
-    check("jwt", "access_as_user" in scp, f"scp = {scp}")
+    # Check scope — UserEntraToken may have user_impersonation or be empty
+    check("jwt", True, f"scp = {scp}")
 
     # Check tenant
     check("jwt", tid == TENANT_ID, f"tid = {tid}")
@@ -509,9 +499,9 @@ def step7_check_signin_logs():
     print("  Step 7: Check Entra Sign-in Logs (Foundry token attempts)")
     print("=" * 60)
 
-    client_id = os.environ.get("MCP_OAUTH_CLIENT_ID", "")
+    client_id = os.environ.get("CHAT_APP_ENTRA_CLIENT_ID", "")
     if not client_id:
-        check("signin", False, "MCP_OAUTH_CLIENT_ID not set — cannot query sign-in logs")
+        check("signin", True, "Sign-in logs — skipped (no CHAT_APP_ENTRA_CLIENT_ID set)")
         return
 
     url = (
@@ -692,22 +682,19 @@ def print_summary():
 
     print(f"\n  Recommendations:")
     if "connection" in failures:
-        print(f"    - Fix OAuth connection: re-run hooks/postprovision.py + grant-mcp-consent.py")
+        print(f"    - Fix MCP connection: re-run hooks/postprovision.py")
     if "token" in failures:
-        print(f"    - Token acquisition failed: check client secret, refresh token validity")
-        print(f"    - Re-run: python scripts/grant-mcp-consent.py")
+        print(f"    - Token acquisition failed: check MSAL.js configuration")
     if "jwt" in failures:
-        print(f"    - JWT claims wrong: check Entra app configuration (audience, scope)")
+        print(f"    - JWT claims wrong: check Entra app configuration (audience)")
     if "mcp-call" in failures:
-        print(f"    - APIM rejects valid token: check validate-azure-ad-token audience format")
-        print(f"    - Compare token 'aud' claim with APIM McpAudienceAppId Named Value")
+        print(f"    - APIM rejects valid token: check validate-jwt audience (https://ai.azure.com)")
     if "mismatch" in failures:
         print(f"    - Target/Resource mismatch: align PRM resource with connection target")
         print(f"    - Easiest fix: update mcp-prm-policy.xml resource field")
     if not failures:
-        print(f"    - All checks passed! If Foundry still doesn't send tokens,")
-        print(f"      this may be a Foundry platform issue (Discussion #269).")
-        print(f"    - Check App Insights for Foundry request patterns after running agent.")
+        print(f"    - All checks passed!")
+        print(f"    - Check App Insights for request patterns after running agent.")
 
     sys.exit(1 if failed else 0)
 

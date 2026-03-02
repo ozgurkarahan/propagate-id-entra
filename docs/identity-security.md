@@ -2,11 +2,11 @@
 
 ## 1. Introduction
 
-This document describes the identity and security architecture of the Identity Propagation PoC. It covers every Entra ID app registration, managed identity, auth flow, OAuth consent mechanism, and APIM token validation policy in the system.
+This document describes the identity and security architecture of the Identity Propagation PoC. It covers the Entra ID app registration, managed identities, auth flows, APIM token validation policy, and all supporting configuration across Bicep, postprovision hook, APIM policies, and application code.
 
 **Core principle: no service accounts in the data path.** A user's identity propagates end-to-end from the browser through the AI agent to the backend API. The only managed-identity flow is the AI Gateway path (APIM to Azure OpenAI), which is outside the user data path.
 
-**Scope:** 3 Entra app registrations, 4 managed identities, 3 distinct auth flows, an OAuth consent mechanism, APIM JWT validation with RFC 9728 Protected Resource Metadata, and all supporting configuration across Bicep, postprovision hook, APIM policies, and application code.
+**Scope:** 1 Entra app registration, 4 managed identities, 3 distinct auth flows, APIM JWT validation with RFC 9728 Protected Resource Metadata, and all supporting configuration across Bicep, postprovision hook, APIM policies, and application code.
 
 ---
 
@@ -17,8 +17,6 @@ This document describes the identity and security architecture of the Identity P
 ```mermaid
 graph TB
     subgraph "Entra ID Tenant"
-        AudienceApp["MCP Gateway Audience<br/>api://{appId}<br/>scope: access_as_user"]
-        ClientApp["Foundry OAuth Client<br/>isFallbackPublicClient: true<br/>client secret (rotated)"]
         ChatSPA["Chat App SPA<br/>SPA redirect URIs<br/>requiredResourceAccess: ai.azure.com"]
         AzureAI["Azure AI Services<br/>(1st party Microsoft app)<br/>18a66f5f-dbdf-4c17-9dd7-1634712a9cbe"]
     end
@@ -39,35 +37,32 @@ graph TB
         OpenAI["Azure OpenAI (gpt-4o)"]
     end
 
-    Browser -->|"Token 1: aud=ai.azure.com"| ChatApp
+    Browser -->|"Token: aud=ai.azure.com"| ChatApp
     ChatSPA -->|"requests scope"| AzureAI
     ChatApp -->|"UserTokenCredential"| Agent
-    Agent -->|"Token 2: aud=api://{appId}"| APIM
-    ClientApp -->|"requests scope access_as_user"| AudienceApp
-    APIM -->|"validates JWT against"| AudienceApp
+    Agent -->|"Token passthrough: aud=ai.azure.com"| APIM
+    APIM -->|"validates JWT"| APIM
     APIM -->|"Token 3: MI auth"| OpenAI
     MI_APIM -->|"Cognitive Services User"| OpenAI
     MI_Chat -->|"Cognitive Services User"| Agent
     APIM -->|"forwards request"| OrdersAPI
 ```
 
-### Entra App Registrations
+### Entra App Registration
 
-All three apps are created by the **postprovision hook** (`hooks/postprovision.py`) using `az` CLI with delegated permissions. The ARM deployment identity lacks `Application.ReadWrite.All` in managed tenants, so the Graph Bicep extension cannot be used.
+The Chat App SPA is created by the **postprovision hook** (`hooks/postprovision.py`) using `az` CLI with delegated permissions. The ARM deployment identity lacks `Application.ReadWrite.All` in managed tenants, so the Graph Bicep extension cannot be used.
 
-| Property | MCP Gateway Audience | Foundry OAuth Client | Chat App SPA |
-|----------|---------------------|---------------------|--------------|
-| **Display Name** | `MCP Gateway Audience ({env})` | `Foundry OAuth Client ({env})` | `Chat App ({env})` |
-| **Purpose** | Defines the API that MCP bearer tokens authenticate against | OAuth client Foundry uses to acquire delegated tokens for MCP | Browser MSAL.js authentication for Chat UI |
-| **App Type** | API (resource server) | Public client (`isFallbackPublicClient: true`) | Public client (`isFallbackPublicClient: true`) |
-| **Sign-in Audience** | `AzureADMyOrg` (single tenant) | `AzureADMyOrg` (single tenant) | `AzureADMyOrg` (single tenant) |
-| **Identifier URI** | `api://{appId}` | None | None |
-| **Exposed Scopes** | `access_as_user` (UUID5 deterministic ID) | None | None |
-| **Required Resource Access** | None | MCP Gateway Audience / `access_as_user` | Azure AI Services / `user_impersonation` (`18a66f5f-dbdf-4c17-9dd7-1634712a9cbe`) |
-| **Redirect URIs** | None | `https://ai.azure.com/auth/callback`, `https://global.consent.azure-apim.net/redirect/{connectorId}` | SPA: `http://localhost:8080`, `https://{chatAppFqdn}` |
-| **Credentials** | None | Client secret (reset on each `azd up`) | None (public SPA) |
-| **Created By** | Hook Step 1 ([1/7]) | Hook Step 1 ([3/7]) | Hook Step 1b |
-| **azd Env Var** | `MCP_AUDIENCE_APP_ID` | `MCP_OAUTH_CLIENT_ID` | `CHAT_APP_ENTRA_CLIENT_ID` |
+| Property | Chat App SPA |
+|----------|--------------|
+| **Display Name** | `Chat App ({env})` |
+| **Purpose** | Browser MSAL.js authentication for Chat UI |
+| **App Type** | Public client (`isFallbackPublicClient: true`) |
+| **Sign-in Audience** | `AzureADMyOrg` (single tenant) |
+| **Redirect URIs** | SPA: `http://localhost:8080`, `https://{chatAppFqdn}` |
+| **Required Resource Access** | Azure AI Services / `user_impersonation` (`18a66f5f-dbdf-4c17-9dd7-1634712a9cbe`) |
+| **Credentials** | None (public SPA) |
+| **Created By** | Postprovision hook Step 1 |
+| **azd Env Var** | `CHAT_APP_ENTRA_CLIENT_ID` |
 
 ### Managed Identities
 
@@ -92,7 +87,7 @@ All three apps are created by the **postprovision hook** (`hooks/postprovision.p
 2. **Token acquisition** — Entra ID returns an access token with `aud=https://ai.azure.com` and the user's `oid`/`sub` claims. MSAL.js caches the token in `sessionStorage`.
 3. **Chat request** — The browser sends `POST /api/chat { message, access_token }` to the Chat App backend. The access token is passed in the request body (not an Authorization header).
 4. **UserTokenCredential** — The Chat App wraps the user's token in a `UserTokenCredential` class that implements the `TokenCredential` interface. This makes the Foundry SDK carry the user's identity.
-5. **Foundry SDK call** — `AIProjectClient(endpoint, credential)` is instantiated with the wrapped token. The chat handler calls `openai_client.responses.create()` with `extra_body={"agent": {"name": "orders-agent", "type": "agent_reference"}}`.
+5. **Foundry SDK call** — `AIProjectClient(endpoint, credential)` is instantiated with the wrapped token. The chat handler calls `openai_client.responses.create()` with `extra_body={"agent_reference": {"name": "orders-assistant", "type": "agent_reference"}}`.
 6. **Identity propagation** — The Foundry service receives the request authenticated as the user, not as a service principal. The user's identity is preserved for downstream MCP tool calls.
 
 ### Sequence Diagram
@@ -109,8 +104,8 @@ sequenceDiagram
 
     Browser->>ChatApp: POST /api/chat<br/>{ message, access_token }
     ChatApp->>ChatApp: UserTokenCredential(token)<br/>wraps as TokenCredential
-    ChatApp->>Foundry: responses.create(input=message)<br/>extra_body={agent: orders-agent}<br/>Authorization: Bearer {user_token}
-    Foundry-->>ChatApp: Agent response (text or consent/approval)
+    ChatApp->>Foundry: responses.create(input=message)<br/>extra_body={agent_reference: orders-assistant}<br/>Authorization: Bearer {user_token}
+    Foundry-->>ChatApp: Agent response (text or approval request)
     ChatApp-->>Browser: { response_id, text, ... }
 ```
 
@@ -118,11 +113,11 @@ sequenceDiagram
 
 | Setting | Value | Source |
 |---------|-------|--------|
-| SPA Client ID | `CHAT_APP_ENTRA_CLIENT_ID` | Postprovision hook Step 1b |
+| SPA Client ID | `CHAT_APP_ENTRA_CLIENT_ID` | Postprovision hook Step 1 |
 | Authority | `https://login.microsoftonline.com/{tenantId}` | `/api/config` endpoint |
 | Scopes | `["https://ai.azure.com/.default"]` | `/api/config` endpoint |
 | Foundry Endpoint | `AI_FOUNDRY_PROJECT_ENDPOINT` | Bicep output (`cognitive.outputs.projectEndpoint`) |
-| Agent Name | `AGENT_NAME` (default: `orders-agent`) | Container App env var |
+| Agent Name | `AGENT_NAME` (default: `orders-assistant`) | Container App env var |
 | Resource App ID | `18a66f5f-dbdf-4c17-9dd7-1634712a9cbe` (Azure Machine Learning Services) | SPA `requiredResourceAccess` |
 | Scope Permission ID | `1a7925b5-f871-417a-9b8b-303f9f29fa10` (`user_impersonation`) | SPA `requiredResourceAccess` |
 
@@ -134,14 +129,14 @@ sequenceDiagram
 
 ---
 
-## 4. Flow B: Foundry Agent to MCP Server via APIM (OAuth Delegated)
+## 4. Flow B: Foundry Agent to MCP Server via APIM (UserEntraToken)
 
 ### Narrative
 
-1. **Agent decides to call MCP tool** — When the agent determines it needs to call an MCP tool (e.g., `list-orders`), it looks up the `mcp-oauth` RemoteTool connection on the Foundry project.
-2. **Token acquisition** — The Foundry Agent Service uses the OAuth credentials stored on the RemoteTool connection (client ID, client secret, refresh token) to acquire a delegated access token from Entra ID. The token scope is `api://{audienceAppId}/access_as_user`.
+1. **Agent decides to call MCP tool** — When the agent determines it needs to call an MCP tool (e.g., `list-orders`), it looks up the `mcp-entra` RemoteTool connection on the Foundry project.
+2. **Token passthrough** — The UserEntraToken connection passes the user's existing Entra token (`aud=https://ai.azure.com`) directly to APIM. No OAuth2 client flow, no consent prompts, no refresh tokens.
 3. **Bearer token sent to APIM** — The agent sends `POST /orders-mcp/mcp` to APIM with `Authorization: Bearer {token}`.
-4. **APIM validates JWT** — The `validate-azure-ad-token` policy checks: audience matches `api://{audienceAppId}`, issuer matches `https://sts.windows.net/{tenantId}/`, token is not expired.
+4. **APIM validates JWT** — The `validate-jwt` policy checks: audience matches `https://ai.azure.com`, issuer matches the tenant (v1 or v2 format), token is not expired.
 5. **Request forwarded** — If valid, APIM forwards the request to the Orders API Container App backend.
 6. **401 challenge on failure** — If validation fails, APIM returns `401 Unauthorized` with a `WWW-Authenticate` header pointing to the RFC 9728 Protected Resource Metadata endpoint.
 
@@ -150,16 +145,13 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     participant Agent as Foundry Agent<br/>(gpt-4o)
-    participant Connection as RemoteTool<br/>Connection<br/>(mcp-oauth)
-    participant Entra as Entra ID
+    participant Connection as RemoteTool<br/>Connection<br/>(mcp-entra)
     participant APIM as APIM<br/>(MCP Gateway)
     participant API as Orders API<br/>(Container App)
 
     Agent->>Connection: MCP tool call (e.g., list-orders)
-    Connection->>Entra: Token request<br/>client_id, client_secret, refresh_token<br/>scope: api://{audienceAppId}/access_as_user
-    Entra-->>Connection: access_token<br/>aud=api://{audienceAppId}<br/>scp=access_as_user<br/>sub={user_oid}
-    Connection->>APIM: POST /orders-mcp/mcp<br/>Authorization: Bearer {token}
-    APIM->>APIM: validate-azure-ad-token<br/>Check aud, issuer, expiry
+    Connection->>APIM: POST /orders-mcp/mcp<br/>Authorization: Bearer {user_token}<br/>(aud=https://ai.azure.com)
+    APIM->>APIM: validate-jwt<br/>Check aud, issuer, expiry
     APIM->>API: Forward request<br/>(HTTP to backend)
     API-->>APIM: 200 OK (response data)
     APIM-->>Agent: MCP tool response
@@ -167,39 +159,41 @@ sequenceDiagram
 
 ### RemoteTool Connection Configuration
 
-The connection is initially deployed via Bicep (`infra/modules/mcp-oauth-connection.bicep`) with placeholder values, then **deleted and recreated** by the postprovision hook via ARM REST PUT to trigger ApiHub connector registration.
+The connection is deployed via Bicep (`infra/modules/mcp-oauth-connection.bicep`) with `authType: UserEntraToken`. No postprovision hook steps are needed for this connection.
 
 | Property | Value | Source |
 |----------|-------|--------|
-| `category` | `RemoteTool` | Required for Agent Service OAuth recognition |
-| `group` | `GenericProtocol` | Required alongside RemoteTool |
-| `authType` | `OAuth2` | OAuth2 delegated flow |
+| `category` | `RemoteTool` | Required for Agent Service MCP tool recognition |
+| `authType` | `UserEntraToken` | Passes user's existing Entra token directly |
 | `target` | `{apimGatewayUrl}/orders-mcp/mcp` | APIM MCP endpoint |
 | `metadata.type` | `custom_MCP` | Identifies as MCP connection |
-| `connectorName` | `mcp-oauth` | Connection identifier |
-| `credentials.clientId` | `{Foundry OAuth Client appId}` | From hook Step 1 |
-| `credentials.clientSecret` | `{rotated secret}` | From hook Step 6 |
-| `authorizationUrl` | `https://login.microsoftonline.com/{tenantId}/oauth2/v2.0/authorize` | Entra v2.0 endpoint |
-| `tokenUrl` | `https://login.microsoftonline.com/{tenantId}/oauth2/v2.0/token` | Entra v2.0 endpoint |
-| `refreshUrl` | `https://login.microsoftonline.com/{tenantId}/oauth2/v2.0/token` | Same as tokenUrl |
-| `scopes` | `["api://{audienceAppId}/access_as_user"]` | MCP Gateway Audience scope |
+| `metadata.audience` | `https://ai.azure.com` | Token audience for the user's token |
 | `isSharedToAll` | `true` | Shared to all project users |
 
-**Why DELETE + PUT?** Bicep-created RemoteTool connections do **not** register the ApiHub connector that Foundry needs for interactive OAuth consent. The postprovision hook must DELETE the Bicep-created connection and PUT a fresh one via ARM REST to trigger ApiHub setup. Without this, Agent Service fails with "Failed to create ApiHub connection: Not Found".
+**Why UserEntraToken?** The user's MSAL.js token (`aud=https://ai.azure.com`) is the same audience that Foundry accepts. The UserEntraToken connection simply passes this token through to APIM, eliminating the need for a separate OAuth2 client flow, consent prompts, refresh tokens, and client secret management.
 
 ### APIM Token Validation
 
-The `validate-azure-ad-token` policy is applied at the MCP API level (`infra/policies/mcp-api-policy.xml`):
+The `validate-jwt` policy is applied at the MCP API level (`infra/policies/mcp-api-policy.xml`):
 
 ```xml
-<validate-azure-ad-token tenant-id="{{McpTenantId}}"
+<validate-jwt header-name="Authorization"
     failed-validation-httpcode="401"
-    failed-validation-error-message="Unauthorized">
+    failed-validation-error-message="Unauthorized"
+    require-scheme="Bearer"
+    output-token-variable-name="jwt">
+    <openid-config url="https://login.microsoftonline.com/{{McpTenantId}}/v2.0/.well-known/openid-configuration" />
     <audiences>
-        <audience>{{McpAudienceAppId}}</audience>
+        <audience>https://ai.azure.com</audience>
     </audiences>
-</validate-azure-ad-token>
+    <issuers>
+        <issuer>https://login.microsoftonline.com/{{McpTenantId}}/v2.0</issuer>
+        <issuer>https://sts.windows.net/{{McpTenantId}}/</issuer>
+    </issuers>
+</validate-jwt>
 ```
+
+Both v1 and v2 issuers are needed — MSAL.js tokens may use either format.
 
 On failure, the `on-error` section returns a 401 with a `WWW-Authenticate` header:
 
@@ -214,8 +208,8 @@ flowchart TD
     A[MCP request arrives at APIM] --> B{Authorization<br/>header present?}
     B -->|No| C[401 Unauthorized]
     B -->|Yes| D[Extract Bearer token]
-    D --> E{validate-azure-ad-token}
-    E --> F{aud matches<br/>audienceAppId?}
+    D --> E{validate-jwt}
+    E --> F{aud matches<br/>ai.azure.com?}
     F -->|No| C
     F -->|Yes| G{issuer matches<br/>tenantId?}
     G -->|No| C
@@ -242,7 +236,7 @@ The PRM endpoint enables MCP clients to auto-discover the OAuth configuration ne
   ],
   "bearer_methods_supported": ["header"],
   "scopes_supported": [
-    "api://{audienceAppId}/access_as_user"
+    "https://ai.azure.com/.default"
   ]
 }
 ```
@@ -253,11 +247,10 @@ The PRM endpoint enables MCP clients to auto-discover the OAuth configuration ne
 
 ### APIM Named Values
 
-| Named Value | Purpose | Initial Value | Final Value |
-|-------------|---------|---------------|-------------|
-| `McpTenantId` | Tenant ID for issuer validation | `tenant().tenantId` (Bicep) | Tenant ID (set at deploy) |
-| `McpAudienceAppId` | Audience for JWT validation | `placeholder-updated-by-hook` | `api://{appId}` (hook Step 2) |
-| `APIMGatewayURL` | Gateway URL for PRM response | `apim.properties.gatewayUrl` (Bicep) | Gateway URL (set at deploy) |
+| Named Value | Purpose | Value |
+|-------------|---------|-------|
+| `McpTenantId` | Tenant ID for issuer validation | `tenant().tenantId` (set at deploy) |
+| `APIMGatewayURL` | Gateway URL for PRM response | `apim.properties.gatewayUrl` (set at deploy) |
 
 ---
 
@@ -302,89 +295,40 @@ sequenceDiagram
 
 ---
 
-## 6. OAuth Consent Flow
+## 6. MCP Tool Approval Flow
 
-### Why Consent Is Needed
+### Responses API Output Item Types
 
-The first time a user interacts with the agent, the Foundry Agent Service needs to acquire a delegated OAuth token on behalf of the user. Since the RemoteTool connection may not yet have a refresh token stored for this user, Foundry triggers an interactive OAuth consent flow via the ApiHub infrastructure (the same infrastructure used by Azure Logic Apps connectors).
+When the Foundry agent calls an MCP tool, the Responses API returns an `mcp_approval_request` that the client must approve before execution proceeds.
 
-Consent is **one-time per user per connection**. After the user authenticates and authorizes the `access_as_user` scope, ApiHub stores the refresh token on the connection. Subsequent calls use the stored refresh token silently.
+| Type | Field | Description |
+|------|-------|-------------|
+| `mcp_approval_request` | `id` | Approval request ID (prefix: `mcpr_...`) |
+| `mcp_approval_request` | `name` | Tool name (e.g., `list-orders`) |
+| `mcp_approval_request` | `server_label` | MCP server label (e.g., `orders_mcp`) |
+| `mcp_approval_request` | `arguments` | Tool call arguments (dict) |
+| `message` | `content[].text` | Agent text response |
 
-### Multi-Turn Sequence Diagram
+### Multi-Turn Flow
 
 ```mermaid
 sequenceDiagram
     participant User as User<br/>(Browser)
     participant Chat as Chat App
     participant Foundry as AI Foundry<br/>(Responses API)
-    participant ApiHub as ApiHub<br/>(consent.azure-apihub.net)
-    participant Entra as Entra ID
 
-    Note over User,Foundry: Turn 1: Initial request triggers consent
+    Note over User,Foundry: Turn 1: Agent decides to call MCP tool
     User->>Chat: "List all orders"
     Chat->>Foundry: responses.create(input="List all orders")
-    Foundry-->>Chat: oauth_consent_request<br/>{ consent_link, id: oauthreq_... }
-    Chat-->>User: Show consent banner with link
-
-    Note over User,Entra: User clicks consent link (new tab)
-    User->>ApiHub: Open consent URL
-    ApiHub->>Entra: OAuth authorize<br/>scope: api://{audienceAppId}/access_as_user
-    Entra-->>User: Sign-in prompt (credentials / MFA)
-    User->>Entra: Authenticate
-    Entra-->>ApiHub: Authorization code
-    ApiHub->>Entra: Exchange code for tokens
-    Entra-->>ApiHub: access_token + refresh_token
-    ApiHub->>ApiHub: Store refresh_token<br/>on RemoteTool connection
-
-    Note over User,Foundry: Turn 2: Continue after consent
-    User->>Chat: Click "I've signed in" button
-    Chat->>Foundry: responses.create(<br/>  previous_response_id=...,<br/>  input="Continue after authentication")
     Foundry-->>Chat: mcp_approval_request<br/>{ id: mcpr_..., name: "list-orders" }
+    Chat-->>User: Show approval button (auto-approve in Chat App)
 
-    Note over Chat,Foundry: Turn 3: Auto-approve MCP tool call
+    Note over User,Foundry: Turn 2: Approve and execute
     Chat->>Foundry: responses.create(<br/>  previous_response_id=...,<br/>  input=[McpApprovalResponse(approve=True)])
-    Foundry->>Foundry: Execute MCP tool<br/>(uses stored refresh_token)
+    Foundry->>Foundry: Execute MCP tool<br/>(UserEntraToken passthrough)
     Foundry-->>Chat: "Here are the orders: ..."
     Chat-->>User: Display order data
 ```
-
-### Consent Infrastructure Details
-
-**ConnectorId format:** `{projectInternalId-as-guid}-{connectionName}`
-- The project's `internalId` is a 32-character hex string from the project's ARM properties
-- Formatted as a GUID: `{8}-{4}-{4}-{4}-{12}` (e.g., `a1b2c3d4-e5f6-7890-abcd-ef1234567890`)
-- Example connectorId: `a1b2c3d4-e5f6-7890-abcd-ef1234567890-mcp-oauth`
-
-**Redirect URI construction:**
-```
-https://global.consent.azure-apim.net/redirect/{connectorId}
-```
-This URI is added to the Foundry OAuth Client app's `web.redirectUris` by the postprovision hook.
-
-**Per-user token storage:** ApiHub stores the refresh token per user on the connection. Each user who consents gets their own stored credential.
-
-### Fallback: Device Code Flow
-
-When interactive browser consent is not possible (e.g., headless environments), the `scripts/grant-mcp-consent.py` script provides an alternative:
-
-1. Initiates device code flow with `MCP_OAUTH_CLIENT_ID`
-2. User authenticates at `https://microsoft.com/devicelogin`
-3. Script receives `access_token + refresh_token`
-4. Stores the refresh token on the connection via ARM REST PUT
-
-The script auto-detects whether the client is public or confidential (retry logic for AADSTS7000218/AADSTS700025).
-
-### Responses API Output Item Types
-
-| Type | Field | Description |
-|------|-------|-------------|
-| `oauth_consent_request` | `consent_link` | URL for user to authenticate via ApiHub |
-| `oauth_consent_request` | `id` | Request ID (prefix: `oauthreq_...`) |
-| `mcp_approval_request` | `id` | Approval request ID (prefix: `mcpr_...`) |
-| `mcp_approval_request` | `name` | Tool name (e.g., `list-orders`) |
-| `mcp_approval_request` | `server_label` | MCP server label (e.g., `orders_mcp`) |
-| `mcp_approval_request` | `arguments` | Tool call arguments (dict) |
-| `message` | `content[].text` | Agent text response |
 
 ---
 
@@ -394,20 +338,19 @@ The script auto-detects whether the client is public or confidential (retry logi
 
 ```mermaid
 graph LR
-    subgraph "Token 1: Browser to Foundry"
+    subgraph "Token: Browser to Foundry"
         T1["aud: https://ai.azure.com"]
         T1S["Issued to: Chat App SPA"]
         T1U["Used by: Chat App to Foundry SDK"]
     end
 
-    subgraph "Token 2: Foundry to APIM MCP"
-        T2["aud: api://{audienceAppId}"]
-        T2S["Issued to: Foundry OAuth Client"]
+    subgraph "Token: Foundry to APIM MCP"
+        T2["aud: https://ai.azure.com"]
+        T2S["Same token passed through"]
         T2U["Used by: MCP tool call to APIM"]
-        T2C["Claims: scp=access_as_user<br/>sub={user_oid}<br/>appid={clientAppId}"]
     end
 
-    subgraph "Token 3: APIM to Azure OpenAI"
+    subgraph "Token: APIM to Azure OpenAI"
         T3["aud: https://cognitiveservices.azure.com"]
         T3S["Issued to: APIM Managed Identity"]
         T3U["Used by: AI Gateway to OpenAI"]
@@ -420,7 +363,7 @@ graph LR
 | Flow | Audience | Issued To | Auth Type | User Identity Propagated? |
 |------|----------|-----------|-----------|--------------------------|
 | Browser to Foundry | `https://ai.azure.com` | Chat App SPA (MSAL.js) | Delegated (user interactive) | Yes |
-| Foundry to APIM MCP | `api://{audienceAppId}` | Foundry OAuth Client (RemoteTool) | Delegated (token exchange via refresh token) | Yes (`sub={user_oid}`, `scp=access_as_user`) |
+| Foundry to APIM MCP | `https://ai.azure.com` | Same user token (UserEntraToken passthrough) | Delegated (token passthrough) | Yes (`sub={user_oid}`) |
 | APIM to Azure OpenAI | `https://cognitiveservices.azure.com` | APIM system-assigned MI | App-only (managed identity) | No (service identity) |
 
 This is the most common source of configuration errors. Each component expects a specific audience — using the wrong one results in `401 Unauthorized` or `AADSTS650057`.
@@ -431,23 +374,19 @@ This is the most common source of configuration errors. Each component expects a
 
 1. **No service accounts in the data path.** User identity propagates from browser through agent to API. The only MI-based flow is AI Gateway (APIM to OpenAI), which is outside the user data path.
 
-2. **Delegated OAuth, not app-only.** The Foundry-to-APIM flow uses delegated permissions (`access_as_user` scope), meaning the token carries both the user's identity (`sub`) and the client app identity (`appid`). This enables per-user audit trails in APIM logs.
+2. **UserEntraToken passthrough, not OAuth2 client flow.** The Foundry-to-APIM flow uses UserEntraToken, meaning the user's existing token (`aud=https://ai.azure.com`) is passed directly to APIM. No separate OAuth2 client, no consent flow, no refresh tokens, no client secrets.
 
-3. **Public clients for SPA and device code.** Both the Chat App SPA and the Foundry OAuth Client use `isFallbackPublicClient: true`. The SPA cannot securely store secrets (browser). The OAuth Client needs public client mode for device code flow in the fallback consent script.
+3. **Public client for SPA.** The Chat App SPA uses `isFallbackPublicClient: true` because browsers cannot securely store secrets.
 
-4. **Single-tenant apps only.** All three apps use `signInAudience: AzureADMyOrg`. This restricts authentication to users in the PoC tenant only, preventing cross-tenant access.
+4. **Single-tenant app only.** The Chat App SPA uses `signInAudience: AzureADMyOrg`. This restricts authentication to users in the PoC tenant only, preventing cross-tenant access.
 
 5. **Response body logging disabled for MCP.** APIM Application Insights response body logging at the All APIs scope **breaks MCP SSE streaming**. Response buffering interferes with the SSE transport, causing the MCP endpoint to hang indefinitely. Frontend and backend response body bytes are set to `0` in the global diagnostics configuration (`infra/modules/apim.bicep`).
 
-6. **Client secret rotation on each deployment.** Every `azd up` runs `az ad app credential reset` (without `--append`), generating a new client secret and replacing the old one. This limits the exposure window of any leaked credential. The tradeoff is that the OAuth connection must be updated after each deployment.
+6. **No credentials to manage.** With UserEntraToken, there are no client secrets, no refresh tokens, and no credentials that need rotation. The only Entra app (Chat App SPA) is a public client with no credentials.
 
-7. **Deterministic scope ID.** The `access_as_user` scope uses a UUID5-based ID: `uuid5(NAMESPACE_URL, 'mcp-access-as-user/{tenantId}')`. This ensures the scope ID is stable across re-runs of the postprovision hook, avoiding orphaned permission grants.
+7. **RFC 9728 Protected Resource Metadata.** The PRM endpoint at `/.well-known/oauth-protected-resource` enables MCP clients to auto-discover the authorization server, supported scopes, and bearer methods. This follows the standard for protected resource metadata rather than requiring out-of-band configuration.
 
-8. **RFC 9728 Protected Resource Metadata.** The PRM endpoint at `/.well-known/oauth-protected-resource` enables MCP clients to auto-discover the authorization server, supported scopes, and bearer methods. This follows the standard for protected resource metadata rather than requiring out-of-band configuration.
-
-9. **Admin consent grant (AllPrincipals).** The postprovision hook creates an `oauth2PermissionGrants` entry with `consentType: AllPrincipals`. This pre-authorizes all users in the tenant to use the `access_as_user` scope without individual consent prompts at the Entra ID level. (ApiHub consent is still required separately.)
-
-10. **Backend trust boundary (APIM as gateway).** The Orders API Container App does not perform its own authentication — it trusts APIM as the security boundary. All token validation happens at the APIM layer. This is acceptable for a PoC; production would add backend auth.
+8. **Backend trust boundary (APIM as gateway).** The Orders API Container App does not perform its own authentication — it trusts APIM as the security boundary. All token validation happens at the APIM layer. This is acceptable for a PoC; production would add backend auth.
 
 ---
 
@@ -455,14 +394,13 @@ This is the most common source of configuration errors. Each component expects a
 
 ### Overview
 
-The Foundry/ApiHub OAuth pipeline is opaque — when Foundry acquires a token via ApiHub to call the MCP endpoint, the token issuance step does not appear in APIM gateway logs or Application Insights. **Entra ID sign-in logs** (`auditLogs/signIns` via Microsoft Graph API) fill this visibility gap by recording every token issuance event for all 3 Entra app registrations.
+Entra ID sign-in logs (`auditLogs/signIns` via Microsoft Graph API) provide visibility into token issuance events for the Chat App SPA registration. This shows when users authenticate via MSAL.js in the browser.
 
 ### What Each Auth Flow Produces in Sign-in Logs
 
 | Auth Flow | App in Sign-in Log | Sign-in Type | Log Table |
 |-----------|--------------------|--------------|-----------|
 | Browser → Chat App (MSAL.js login) | Chat App SPA | Interactive (`SigninLogs`) | `SigninLogs` |
-| Foundry → APIM MCP (OAuth token exchange) | Foundry OAuth Client | Non-interactive (refresh token grant) | `SigninLogs` |
 | APIM → Azure OpenAI (managed identity) | APIM service principal | Service principal | `AADServicePrincipalSignInLogs` |
 
 ### Fields Available Per Sign-in Event
@@ -484,7 +422,6 @@ The Foundry/ApiHub OAuth pipeline is opaque — when Foundry acquires a token vi
 |--------|-------------|-------|
 | **Workbook "OAuth Audit" tab** | Entra ID diagnostic settings → Log Analytics | Queries `SigninLogs` and `AADServicePrincipalSignInLogs` KQL tables. Requires Security Admin role to configure diagnostic settings. |
 | **`scripts/check-signin-logs.py`** | `AuditLog.Read.All` delegated permission via `az login` | Queries Graph API directly. Works immediately without diagnostic settings. Supports `--hours` and `--app-filter` flags. |
-| **`verify_deployment.py` check #37** | `AuditLog.Read.All` (soft pass if unavailable) | Quick smoke test — queries last 5 sign-in events for the OAuth Client app. |
 
 ### Entra Diagnostic Settings Constraint
 
@@ -492,48 +429,9 @@ Routing Entra sign-in logs to Log Analytics (required for the workbook tab) requ
 
 **Workaround:** Use `scripts/check-signin-logs.py` which queries the Graph API directly with the `AuditLog.Read.All` delegated permission available to the current `az login` user.
 
-### Example Graph API Query
-
-```
-GET https://graph.microsoft.com/v1.0/auditLogs/signIns
-  ?$filter=appId eq '{MCP_OAUTH_CLIENT_ID}'
-    and createdDateTime ge 2024-01-01T00:00:00Z
-  &$top=50
-  &$orderby=createdDateTime desc
-  &$select=createdDateTime,userDisplayName,appDisplayName,
-    resourceDisplayName,status,ipAddress,conditionalAccessStatus
-```
-
 ---
 
 ## 9. Configuration Reference
-
-### Entra App Settings: MCP Gateway Audience
-
-| Property | Value |
-|----------|-------|
-| `displayName` | `MCP Gateway Audience ({env})` |
-| `signInAudience` | `AzureADMyOrg` |
-| `identifierUris` | `["api://{appId}"]` |
-| `api.oauth2PermissionScopes[0].value` | `access_as_user` |
-| `api.oauth2PermissionScopes[0].id` | `uuid5(NAMESPACE_URL, 'mcp-access-as-user/{tenantId}')` |
-| `api.oauth2PermissionScopes[0].type` | `User` |
-| `api.oauth2PermissionScopes[0].adminConsentDisplayName` | `Access MCP Gateway as user` |
-| Service Principal | Created by hook ([4/7]) |
-
-### Entra App Settings: Foundry OAuth Client
-
-| Property | Value |
-|----------|-------|
-| `displayName` | `Foundry OAuth Client ({env})` |
-| `signInAudience` | `AzureADMyOrg` |
-| `isFallbackPublicClient` | `true` |
-| `web.redirectUris` | `["https://ai.azure.com/auth/callback", "https://global.consent.azure-apim.net/redirect/{connectorId}"]` |
-| `requiredResourceAccess[0].resourceAppId` | `{MCP Gateway Audience appId}` |
-| `requiredResourceAccess[0].resourceAccess[0].id` | `{scope_id}` (type: `Scope`) |
-| Client Secret | Reset on each `azd up` (hook [6/7]) |
-| Service Principal | Created by hook ([4/7]) |
-| Admin Consent | `AllPrincipals` for `access_as_user` (hook [5/7]) |
 
 ### Entra App Settings: Chat App SPA
 
@@ -545,7 +443,7 @@ GET https://graph.microsoft.com/v1.0/auditLogs/signIns
 | `spa.redirectUris` | `["http://localhost:8080", "https://{chatAppFqdn}"]` |
 | `requiredResourceAccess[0].resourceAppId` | `18a66f5f-dbdf-4c17-9dd7-1634712a9cbe` (Azure AI Services) |
 | `requiredResourceAccess[0].resourceAccess[0].id` | `1a7925b5-f871-417a-9b8b-303f9f29fa10` (`user_impersonation`) |
-| Service Principal | Created by hook (Step 1b) |
+| Service Principal | Created by hook (Step 1) |
 
 ### RBAC Role Assignments
 
@@ -561,21 +459,17 @@ GET https://graph.microsoft.com/v1.0/auditLogs/signIns
 | Variable | Value | Set By |
 |----------|-------|--------|
 | `AI_FOUNDRY_PROJECT_ENDPOINT` | `https://aoai-{env}.services.ai.azure.com/api/projects/aiproj-{env}` | Bicep (`chat-app.bicep`) |
-| `AGENT_NAME` | `orders-agent` | Bicep (`chat-app.bicep`) |
-| `CHAT_APP_ENTRA_CLIENT_ID` | `{Chat App SPA appId}` | Postprovision hook Step 4 (`az containerapp update`) |
-| `TENANT_ID` | `{tenantId}` | Postprovision hook Step 4 |
-| `MCP_AUDIENCE_APP_ID` | `{MCP Gateway Audience appId}` | Postprovision hook Step 4 |
+| `AGENT_NAME` | `orders-assistant` | Bicep (`chat-app.bicep`) |
+| `CHAT_APP_ENTRA_CLIENT_ID` | `{Chat App SPA appId}` | Postprovision hook Step 3 (`az containerapp update`) |
+| `TENANT_ID` | `{tenantId}` | Postprovision hook Step 3 |
 
 ### azd Environment Variables (Set by Postprovision Hook)
 
 | Variable | Description | Set By |
 |----------|-------------|--------|
-| `MCP_AUDIENCE_APP_ID` | MCP Gateway Audience app ID | Hook Step 1 (`azd env set`) |
-| `MCP_OAUTH_CLIENT_ID` | Foundry OAuth Client app ID | Hook Step 1 (`azd env set`) |
-| `MCP_OAUTH_CLIENT_SECRET` | Foundry OAuth Client secret | Hook Step 1 (`azd env set`) |
-| `CHAT_APP_ENTRA_CLIENT_ID` | Chat App SPA app ID | Hook Step 1b (`azd env set`) |
+| `CHAT_APP_ENTRA_CLIENT_ID` | Chat App SPA app ID | Hook Step 1 (`azd env set`) |
 
-These variables persist in the azd environment and are used by scripts (`verify_deployment.py`, `grant-mcp-consent.py`, `test-agent-oauth.py`).
+This variable persists in the azd environment and is used by scripts (`verify_deployment.py`, `check-signin-logs.py`, `test-agent.py`).
 
 ---
 
@@ -583,26 +477,14 @@ These variables persist in the azd environment and are used by scripts (`verify_
 
 The postprovision hook (`hooks/postprovision.py`) runs after Bicep deployment completes. From an identity perspective, it performs these steps:
 
-1. **Step 1: Create and configure Entra apps**
-   - [1/7] Create MCP Gateway Audience app (or skip if exists). PATCH `oauth2PermissionScopes` to expose `access_as_user`.
-   - [2/7] Set `identifierUris` to `api://{appId}`.
-   - [3/7] Create Foundry OAuth Client app (or skip if exists). PATCH `requiredResourceAccess` to reference the audience app's scope. Compute ApiHub connectorId and add consent redirect URI.
-   - [4/7] Create service principals for both apps.
-   - [5/7] Create admin consent grant (`AllPrincipals`) for `access_as_user` scope.
-   - [6/7] Reset client secret on the OAuth Client app. Set `MCP_AUDIENCE_APP_ID`, `MCP_OAUTH_CLIENT_ID`, `MCP_OAUTH_CLIENT_SECRET` via `azd env set`.
-   - [7/7] DELETE the Bicep-created `mcp-oauth` connection, then PUT a fresh one via ARM REST with real credentials (triggers ApiHub connector registration).
-
-2. **Step 1b: Create Chat App Entra registration**
+1. **Step 1: Create Chat App Entra registration**
    - Create SPA app registration with redirect URIs for localhost and deployed FQDN.
    - PATCH `requiredResourceAccess` for Azure AI Services (`user_impersonation`).
    - Create service principal. Set `CHAT_APP_ENTRA_CLIENT_ID` via `azd env set`.
 
-3. **Step 2: Update APIM Named Value**
-   - PUT `McpAudienceAppId` Named Value with `api://{appId}` so the `validate-azure-ad-token` policy uses the real audience.
+2. **Step 2: Create Foundry agent**
+   - Create `orders-assistant` with `MCPTool` referencing the `mcp-entra` connection and the MCP endpoint.
+   - The agent's `project_connection_id` links to the UserEntraToken connection.
 
-4. **Step 3: Create Foundry agent**
-   - Create `orders-agent` with `MCPTool` referencing the `mcp-oauth` connection and the MCP endpoint.
-   - (Not strictly identity, but the agent's `project_connection_id` links to the OAuth connection.)
-
-5. **Step 4: Update Chat App settings**
-   - `az containerapp update` to set `CHAT_APP_ENTRA_CLIENT_ID`, `TENANT_ID`, and `MCP_AUDIENCE_APP_ID` environment variables on `ca-chat-app`.
+3. **Step 3: Update Chat App settings**
+   - `az containerapp update` to set `CHAT_APP_ENTRA_CLIENT_ID`, `TENANT_ID`, and `AGENT_NAME` environment variables on `ca-chat-app`.

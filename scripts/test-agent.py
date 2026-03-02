@@ -1,12 +1,11 @@
-"""Interactive test: Agent MCP round-trip with OAuth consent flow.
+"""Interactive test: Agent MCP round-trip with tool approval.
 
 Handles the multi-turn Responses API flow:
-  Turn 1: Agent hits MCP -> 401 -> Foundry returns oauth_consent_request
-  Turn 2: User authenticates via consent_link -> continue with previous_response_id
-  Turn 3: (if needed) MCP approval -> approve -> continue
+  Turn 1: Agent calls MCP tools -> Foundry returns mcp_approval_request
+  Turn 2: User approves -> agent executes tools and returns results
 
 Usage:
-  python scripts/test-agent-oauth.py
+  python scripts/test-agent.py
 """
 
 import argparse
@@ -14,7 +13,6 @@ import json
 import os
 import subprocess
 import sys
-import webbrowser
 
 os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 
@@ -39,9 +37,7 @@ def dump_output_items(output_items):
         item_type = getattr(item, "type", "unknown")
         item_id = getattr(item, "id", "")
         print(f"  [{i}] type={item_type}, id={item_id}")
-        if item_type == "oauth_consent_request":
-            print(f"       consent_link={getattr(item, 'consent_link', '')}")
-        elif item_type == "mcp_approval_request":
+        if item_type == "mcp_approval_request":
             print(f"       server={getattr(item, 'server_label', '')}")
             print(f"       tool={getattr(item, 'name', '')}")
             print(f"       args={getattr(item, 'arguments', {})}")
@@ -56,7 +52,7 @@ def dump_output_items(output_items):
 
 def main():
     print("=" * 60)
-    print("  Agent MCP Round-Trip with OAuth Consent (Orders)")
+    print("  Agent MCP Round-Trip (Orders)")
     print("=" * 60)
     print()
 
@@ -120,50 +116,6 @@ def main():
     dump_output_items(output_items)
     print()
 
-    # Check for OAuth consent
-    consent_items = [
-        item for item in output_items
-        if getattr(item, "type", "") == "oauth_consent_request"
-    ]
-
-    if consent_items:
-        consent_link = getattr(consent_items[0], "consent_link", "")
-        print("=" * 60)
-        print("  OAuth consent required!")
-        print("=" * 60)
-        print()
-        print(f"  Consent link: {consent_link}")
-        print()
-
-        # Try to open in browser
-        try:
-            webbrowser.open(consent_link)
-            print("  (Opening in browser...)")
-        except Exception:
-            print("  Please open the link above in your browser.")
-
-        print()
-        input("  Press ENTER after you have completed authentication...")
-        print()
-
-        # === Turn 2: Continue after consent ===
-        print("--- Turn 2: Continue after OAuth consent ---")
-        print("(this may take 30-60s...)")
-        print()
-
-        response = openai_client.responses.create(
-            previous_response_id=response.id,
-            input=query_text,
-            extra_body={"agent_reference": {"name": agent_name, "type": "agent_reference"}},
-        )
-
-        output_items = getattr(response, "output", [])
-        output_types = [getattr(item, "type", "unknown") for item in output_items]
-        print(f"Response ID: {response.id}")
-        print(f"Output types: {output_types}")
-        dump_output_items(output_items)
-        print()
-
     # Check for MCP approval requests
     approval_items = [
         item for item in output_items
@@ -203,7 +155,7 @@ def main():
                 ]
 
             print()
-            print("--- Turn 3: Continue after MCP approval ---")
+            print("--- Turn 2: Continue after MCP approval ---")
             print("(this may take 30-60s...)")
             print()
 
@@ -255,7 +207,7 @@ def main():
 
 if __name__ == "__main__":
     argparse.ArgumentParser(
-        description="Interactive test: Agent MCP round-trip with OAuth consent flow. "
-        "Handles multi-turn Responses API flow (consent + approval)."
+        description="Interactive test: Agent MCP round-trip. "
+        "Handles multi-turn Responses API flow (approval)."
     ).parse_args()
     main()

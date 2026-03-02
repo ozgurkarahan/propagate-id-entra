@@ -16,12 +16,12 @@ Browser (MSAL.js)
 └────────┬────────────┘
          │  openai_client.responses.create()
          ▼
-┌─────────────────────┐     ┌──────────────────┐
-│  AI Foundry Agent   │────▶│  OAuth Consent   │
-│  (gpt-4o)           │     │  (ApiHub)         │
-└────────┬────────────┘     └──────────────────┘
+┌─────────────────────┐
+│  AI Foundry Agent   │
+│  (gpt-4o)           │
+└────────┬────────────┘
          │
-         │ Orders MCP
+         │ Orders MCP (UserEntraToken)
          ▼
 ┌──────────────────────────────────────────────────┐
 │  API Management (APIM)                            │
@@ -38,7 +38,7 @@ Browser (MSAL.js)
 └──────────────────┘
 ```
 
-An AI Foundry agent uses an **MCP tool** to call the Orders API through APIM. APIM also serves as an **AI Gateway** — proxying Azure OpenAI with managed identity auth, token rate limiting, and token metrics.
+An AI Foundry agent uses an **MCP tool** to call the Orders API through APIM. The user's Entra token is passed directly via a **UserEntraToken** connection — no OAuth2 client flow, no consent prompts, no refresh token expiry. APIM also serves as an **AI Gateway** — proxying Azure OpenAI with managed identity auth, token rate limiting, and token metrics.
 
 ## Resource Overview
 
@@ -80,14 +80,11 @@ azd up
 # Verify the deployment
 python scripts/verify_deployment.py
 
-# Grant OAuth consent via device code flow
-python scripts/grant-mcp-consent.py
-
-# Test agent with OAuth identity propagation (interactive)
-python scripts/test-agent-oauth.py
+# Test agent interactively
+python scripts/test-agent.py
 ```
 
-`azd up` runs Bicep provisioning, builds and deploys the Orders API and Chat App containers, then executes the post-provision hook to create Entra app registrations and the Foundry agent.
+`azd up` runs Bicep provisioning, builds and deploys the Orders API and Chat App containers, then executes the post-provision hook to create the Chat App Entra registration and the Foundry agent.
 
 ## Project Structure
 
@@ -100,7 +97,7 @@ python scripts/test-agent-oauth.py
 │   ├── main.parameters.json      # Parameters (azd env vars)
 │   ├── policies/
 │   │   ├── ai-gateway-policy.xml    # APIM OpenAI proxy policy
-│   │   ├── mcp-api-policy.xml       # validate-azure-ad-token + 401 challenge
+│   │   ├── mcp-api-policy.xml       # validate-jwt + 401 challenge
 │   │   └── mcp-prm-policy.xml       # RFC 9728 Protected Resource Metadata
 │   └── modules/
 │       ├── cognitive.bicep          # AI Services + Project + gpt-4o
@@ -113,8 +110,7 @@ python scripts/test-agent-oauth.py
 │       ├── workbook.bicep           # Azure Monitor Workbook
 │       ├── role-assignment.bicep    # Cognitive Services User → APIM MI
 │       ├── ai-gateway-connection.bicep
-│       ├── mcp-oauth-connection.bicep
-│       ├── entra-apps.bicep         # Graph Bicep (reference only — see note)
+│       ├── mcp-oauth-connection.bicep  # UserEntraToken MCP connection
 │       ├── storage.bicep            # (future)
 │       └── keyvault.bicep           # (future)
 ├── infra/workbooks/
@@ -133,12 +129,11 @@ python scripts/test-agent-oauth.py
 │   └── requirements.txt
 ├── hooks/
 │   ├── postprovision.sh          # Shell wrapper (installs deps, calls .py)
-│   └── postprovision.py          # Entra apps + Foundry agent creation
+│   └── postprovision.py          # Chat App Entra registration + Foundry agent
 ├── scripts/
 │   ├── verify_deployment.py          # Deployment verification
-│   ├── diagnose-mcp-auth.py          # MCP OAuth diagnostic
-│   ├── test-agent-oauth.py           # Interactive multi-turn agent test
-│   ├── grant-mcp-consent.py          # Device code flow → OAuth refresh token
+│   ├── diagnose-mcp-auth.py          # MCP auth diagnostic
+│   ├── test-agent.py                 # Interactive agent test
 │   ├── check-signin-logs.py          # Entra sign-in log viewer (Graph API)
 │   └── generate_resource_inventory.py
 └── docs/
@@ -181,18 +176,17 @@ Modules deploy in dependency order:
 
 **Bicep first** — every resource Bicep can create is defined in Bicep. The post-provision hook handles only what Bicep cannot deploy:
 
-- **Entra App Registrations** — ARM deployment identity lacks `Application.ReadWrite.All` in managed tenants; the hook uses `az ad app` with delegated permissions instead.
+- **Entra App Registration** — ARM deployment identity lacks `Application.ReadWrite.All` in managed tenants; the hook uses `az ad app` with delegated permissions instead.
 - **Foundry Agent** — No ARM resource type exists; created via the `azure-ai-projects` SDK.
 
 ## Scripts
 
 | Script | Purpose |
 |--------|---------|
-| `scripts/verify_deployment.py` | Deployment verification across infra, post-provision, OAuth, and functional layers |
-| `scripts/diagnose-mcp-auth.py` | MCP OAuth diagnostic — end-to-end token flow |
-| `scripts/test-agent-oauth.py` | Interactive multi-turn agent test with OAuth consent + MCP approval |
-| `scripts/grant-mcp-consent.py` | Device code flow to populate the OAuth connection with a refresh token |
-| `scripts/check-signin-logs.py` | Query Entra ID sign-in logs for all 3 app registrations (Graph API) |
+| `scripts/verify_deployment.py` | Deployment verification across infra, post-provision, connection, and functional layers |
+| `scripts/diagnose-mcp-auth.py` | MCP auth diagnostic — endpoint and connection checks |
+| `scripts/test-agent.py` | Interactive agent test with MCP tool approval |
+| `scripts/check-signin-logs.py` | Query Entra ID sign-in logs (Graph API) |
 | `scripts/generate_resource_inventory.py` | Query ARM APIs and generate a resource inventory document |
 
 ## Observability
@@ -214,13 +208,12 @@ The Azure Monitor Workbook (`infra/workbooks/identity-propagation.json`) provide
 | CognitiveServices name reuse after purge | `azd env set COGNITIVE_ACCOUNT_SUFFIX 2` (increment for each purge) |
 | Windows charmap errors in ACR build | `az acr build --no-logs` |
 | MSYS path conversion in Git Bash | `export MSYS_NO_PATHCONV=1` before `az` commands with resource ID paths |
-| Managed tenant blocks local auth | All connections use `authType: 'AAD'` |
-| New client secret after re-deploy | Re-run `python scripts/test-agent-oauth.py` after each `azd up` |
+| Managed tenant blocks local auth | All connections use `authType: 'AAD'` or `UserEntraToken` |
 
 ## Documentation
 
 - [`AGENT.md`](AGENT.md) — Architecture, auth flow diagrams, dependency chain
-- [`docs/identity-security.md`](docs/identity-security.md) — Identity & security architecture: Entra app registrations, managed identities, auth flows, OAuth consent, APIM JWT validation with RFC 9728 Protected Resource Metadata, security design decisions, and configuration reference
+- [`docs/identity-security.md`](docs/identity-security.md) — Identity & security architecture: Entra app registration, managed identities, auth flows, APIM JWT validation with RFC 9728 Protected Resource Metadata, security design decisions, and configuration reference
 - [`docs/deep-dive.md`](docs/deep-dive.md) — ARM resource details, step-by-step build guide, data flows
 - [`docs/project-reference.md`](docs/project-reference.md) — Technical reference for development
 

@@ -8,12 +8,6 @@ param environmentName string
 @description('Azure region for all resources')
 param location string = 'swedencentral'
 
-// Placeholder client secret for the OAuth connection — postprovision hook
-// replaces this with a real app credential via ARM REST PUT.
-@secure()
-@description('Temporary client secret placeholder (replaced by postprovision)')
-param mcpOAuthClientSecretPlaceholder string = newGuid()
-
 @description('Suffix for the CognitiveServices account name (increment after azd down --purge)')
 param cognitiveAccountSuffix string = ''
 
@@ -229,9 +223,6 @@ module mcpOAuthConnection 'modules/mcp-oauth-connection.bicep' = {
     cognitiveAccountName: cognitive.outputs.cognitiveAccountName
     projectName: cognitive.outputs.projectName
     mcpEndpoint: apimMcp.outputs.mcpEndpoint
-    clientId: 'placeholder-updated-by-hook'
-    clientSecret: mcpOAuthClientSecretPlaceholder
-    audienceAppId: 'placeholder-updated-by-hook'
   }
 }
 
@@ -252,9 +243,9 @@ output APIM_OPENAI_ENDPOINT string = '${apim.outputs.apimGatewayUrl}/openai'
 output COGNITIVE_ACCOUNT_NAME string = cognitive.outputs.cognitiveAccountName
 output AZURE_RESOURCE_GROUP string = rg.name
 output APIM_MCP_ENDPOINT string = apimMcp.outputs.mcpEndpoint
-output MCP_OAUTH_CONNECTION_NAME string = mcpOAuthConnection.outputs.connectionName
+output MCP_CONNECTION_NAME string = mcpOAuthConnection.outputs.connectionName
 output CHAT_APP_URL string = 'https://${chatApp.outputs.chatAppFqdn}'
 output CHAT_APP_FQDN string = chatApp.outputs.chatAppFqdn
 output CHAT_APP_CONTAINER_APP_NAME string = chatApp.outputs.chatAppName
-// MCP_AUDIENCE_APP_ID, MCP_OAUTH_CLIENT_ID, CHAT_APP_ENTRA_CLIENT_ID set by postprovision hook
-// (Entra apps created via az CLI, not Bicep)
+// CHAT_APP_ENTRA_CLIENT_ID set by postprovision hook
+// (Entra app created via az CLI, not Bicep)

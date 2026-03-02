@@ -6,9 +6,6 @@ let currentAccount = null;
 let lastResponseId = null;
 let msalConfig = null;
 let appInsights = null;
-let pendingRetryMessage = null;
-let awaitingPostConsentRetry = false;
-let postConsentRetryCount = 0;
 const sessionId = crypto.randomUUID();
 
 // ---------------------------------------------------------------------------
@@ -147,14 +144,7 @@ async function sendMessage() {
 
         if (!resp.ok) {
             const err = await resp.json().catch(() => ({ detail: resp.statusText }));
-            const detail = err.detail || resp.statusText;
-            if (isAuthError(detail)) {
-                pendingRetryMessage = message;
-                showReauthBanner();
-                setLoading(false);
-                return;
-            }
-            addSystemMessage('Error: ' + detail);
+            addSystemMessage('Error: ' + (err.detail || resp.statusText));
             setLoading(false);
             return;
         }
@@ -165,9 +155,6 @@ async function sendMessage() {
             name: 'ChatResponse',
             properties: { type: data.type, responseId: data.response_id, requestId: data.request_id }
         });
-        // Store original message — consent chain may need to retry with it
-        pendingRetryMessage = message;
-        postConsentRetryCount = 0;
         handleResponse(data);
     } catch (err) {
         if (appInsights) appInsights.trackException({ exception: err });
@@ -178,186 +165,14 @@ async function sendMessage() {
 }
 
 function handleResponse(data) {
-    if (data.consent_required) {
-        showConsentBanner(data.consent_link);
-    } else if (data.approval_required) {
+    if (data.approval_required) {
         addSystemMessage('Agent requesting tool access — auto-approving...');
         autoApprove(data.approval_ids.map(a => a.id));
-    } else if (awaitingPostConsentRetry && pendingRetryMessage && postConsentRetryCount < 2) {
-        // Consent chain completed — agent returned text without calling tools.
-        // Re-send the original query so the agent uses the now-authorized MCP tools.
-        awaitingPostConsentRetry = false;
-        postConsentRetryCount++;
-        retryOriginalQuery();
     } else if (data.text) {
         addMessage('assistant', data.text);
     } else {
         addSystemMessage('Agent returned no text response.');
     }
-}
-
-// ---------------------------------------------------------------------------
-// Consent flow
-// ---------------------------------------------------------------------------
-
-function showConsentBanner(link) {
-    const banner = document.getElementById('consentBanner');
-    const consentLink = document.getElementById('consentLink');
-    consentLink.href = link;
-    banner.classList.add('visible');
-}
-
-async function continueAfterConsent() {
-    document.getElementById('consentBanner').classList.remove('visible');
-    setLoading(true);
-
-    // Signal that after the consent chain finishes, we should auto-retry
-    // with the original query (pendingRetryMessage).
-    awaitingPostConsentRetry = true;
-
-    try {
-        const token = await getAccessToken();
-        const resp = await fetch('/api/chat', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                message: 'Continue after authentication',
-                access_token: token,
-                previous_response_id: lastResponseId,
-                session_id: sessionId,
-            }),
-        });
-
-        if (!resp.ok) {
-            const err = await resp.json().catch(() => ({ detail: resp.statusText }));
-            addSystemMessage('Error: ' + (err.detail || resp.statusText));
-            setLoading(false);
-            return;
-        }
-
-        const data = await resp.json();
-        lastResponseId = data.response_id;
-        handleResponse(data);
-    } catch (err) {
-        addSystemMessage('Error after consent: ' + err.message);
-    }
-
-    setLoading(false);
-}
-
-// Auto-retry with the original query after all consent rounds complete.
-// Starts a FRESH conversation (no previous_response_id) so Foundry
-// re-evaluates all MCP connections. Already-consented connections work
-// silently; unconsented ones trigger new oauth_consent_request.
-async function retryOriginalQuery() {
-    setLoading(true);
-
-    try {
-        const token = await getAccessToken();
-        const message = pendingRetryMessage;
-        // Keep pendingRetryMessage for one more round — fresh conversation may
-        // trigger SF consent (Orders already consented, works silently).
-        // Will be cleared if this retry returns text (no more consent loops).
-        lastResponseId = null; // Fresh conversation — force full MCP re-evaluation
-
-        const resp = await fetch('/api/chat', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                message: message,
-                access_token: token,
-                session_id: sessionId,
-            }),
-        });
-
-        if (!resp.ok) {
-            const err = await resp.json().catch(() => ({ detail: resp.statusText }));
-            addSystemMessage('Error: ' + (err.detail || resp.statusText));
-            setLoading(false);
-            return;
-        }
-
-        const data = await resp.json();
-        lastResponseId = data.response_id;
-        handleResponse(data);
-    } catch (err) {
-        addSystemMessage('Error retrying query: ' + err.message);
-    }
-
-    setLoading(false);
-}
-
-// ---------------------------------------------------------------------------
-// Re-authentication flow (token expiry)
-// ---------------------------------------------------------------------------
-
-function isAuthError(detail) {
-    if (!detail) return false;
-    const lower = detail.toLowerCase();
-    return (lower.includes('401') && lower.includes('authentication')) ||
-           lower.includes('tool_user_error');
-}
-
-function showReauthBanner() {
-    document.getElementById('reauthBanner').classList.add('visible');
-}
-
-async function resetAndRetry() {
-    document.getElementById('reauthBanner').classList.remove('visible');
-    addSystemMessage('Resetting MCP connections...');
-    setLoading(true);
-
-    try {
-        const token = await getAccessToken();
-
-        // Step 1: Reset connections via managed identity
-        const resetResp = await fetch('/api/reset-mcp-auth', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ access_token: token }),
-        });
-
-        if (!resetResp.ok) {
-            const err = await resetResp.json().catch(() => ({ detail: resetResp.statusText }));
-            addSystemMessage('Reset failed: ' + (err.detail || resetResp.statusText));
-            setLoading(false);
-            return;
-        }
-
-        const resetData = await resetResp.json();
-        addSystemMessage('Connections reset: ' + resetData.connections.join(', '));
-
-        // Step 2: Retry the original message — should trigger oauth_consent_request
-        lastResponseId = null;
-        pendingRetryMessage = pendingRetryMessage || 'List all orders';
-        const message = pendingRetryMessage;
-        // Keep pendingRetryMessage set — consent flow needs it for retryOriginalQuery()
-
-        const resp = await fetch('/api/chat', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                message: message,
-                access_token: token,
-                session_id: sessionId,
-            }),
-        });
-
-        if (!resp.ok) {
-            const err = await resp.json().catch(() => ({ detail: resp.statusText }));
-            addSystemMessage('Retry failed: ' + (err.detail || resp.statusText));
-            setLoading(false);
-            return;
-        }
-
-        const data = await resp.json();
-        lastResponseId = data.response_id;
-        handleResponse(data);
-    } catch (err) {
-        addSystemMessage('Reset error: ' + err.message);
-    }
-
-    setLoading(false);
 }
 
 // ---------------------------------------------------------------------------

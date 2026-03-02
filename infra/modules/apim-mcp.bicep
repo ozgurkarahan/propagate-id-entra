@@ -85,16 +85,6 @@ resource mcpTenantIdNV 'Microsoft.ApiManagement/service/namedValues@2024-06-01-p
   }
 }
 
-resource mcpAudienceAppIdNV 'Microsoft.ApiManagement/service/namedValues@2024-06-01-preview' = {
-  parent: apim
-  name: 'McpAudienceAppId'
-  properties: {
-    displayName: 'McpAudienceAppId'
-    value: 'placeholder-updated-by-hook'
-    secret: false
-  }
-}
-
 resource apimGatewayUrlNV 'Microsoft.ApiManagement/service/namedValues@2024-06-01-preview' = {
   parent: apim
   name: 'APIMGatewayURL'
@@ -115,7 +105,7 @@ resource mcpApiPolicy 'Microsoft.ApiManagement/service/apis/policies@2024-06-01-
     format: 'rawxml'
     value: loadTextContent('../policies/mcp-api-policy.xml')
   }
-  dependsOn: [ mcpTenantIdNV, mcpAudienceAppIdNV, apimGatewayUrlNV ]
+  dependsOn: [ mcpTenantIdNV, apimGatewayUrlNV ]
 }
 
 // --------------------------------------------------------------------------

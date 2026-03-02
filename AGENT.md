@@ -20,15 +20,15 @@ Browser (MSAL.js)
 └────────┬────────────┘
          │  openai_client.responses.create()
          ▼
-┌─────────────────────┐     ┌──────────────────┐
-│  AI Foundry Agent   │────▶│  OAuth Consent   │
-│  (gpt-4o)           │     │  (ApiHub)         │
-└────────┬────────────┘     └──────────────────┘
-         │ Orders MCP (Bearer token)
+┌─────────────────────┐
+│  AI Foundry Agent   │
+│  (gpt-4o)           │
+└────────┬────────────┘
+         │ Orders MCP (Bearer token via UserEntraToken)
          ▼
 ┌──────────────────────────────────────────────────┐
 │  API Management (APIM)                            │
-│  ├─ Orders MCP API  (/orders-mcp)  validate-azure-ad-token
+│  ├─ Orders MCP API  (/orders-mcp)  validate-jwt   │
 │  ├─ Orders REST API (/orders-api)                 │
 │  └─ Azure OpenAI API (/openai)     MI auth + token rate limit
 └────────┬─────────────────────────────────────────┘
@@ -51,8 +51,7 @@ Browser (MSAL.js)
 azd env new propagate-id-entra
 azd up
 python scripts/verify_deployment.py
-python scripts/grant-mcp-consent.py
-python scripts/test-agent-oauth.py
+python scripts/test-agent.py
 ```
 
 ### Key Paths
@@ -60,10 +59,10 @@ python scripts/test-agent-oauth.py
 - `src/orders-api/` — FastAPI Orders CRUD backend (6 endpoints, 8 seed orders)
 - `src/chat-app/` — FastAPI backend + vanilla JS SPA with MSAL.js
 - `infra/main.bicep` — Subscription-scoped Bicep orchestrator
-- `infra/modules/` — Bicep modules (14 modules)
+- `infra/modules/` — Bicep modules (13 modules)
 - `infra/policies/` — APIM policies (ai-gateway, mcp-api, mcp-prm)
-- `hooks/postprovision.py` — Entra app registrations + Foundry agent creation
-- `scripts/` — Deployment verification, diagnostics, OAuth consent, sign-in logs
+- `hooks/postprovision.py` — Chat App Entra registration + Foundry agent creation
+- `scripts/` — Deployment verification, diagnostics, testing
 
 ### Key Commands
 
@@ -74,11 +73,8 @@ azd up
 # Verify deployment
 python scripts/verify_deployment.py
 
-# Test OAuth flow interactively
-python scripts/test-agent-oauth.py
-
-# Grant OAuth consent (headless/device code)
-python scripts/grant-mcp-consent.py
+# Test agent interactively
+python scripts/test-agent.py
 
 # Diagnose MCP auth issues
 python scripts/diagnose-mcp-auth.py
@@ -93,9 +89,9 @@ python scripts/check-signin-logs.py
 
 Browser signs in via MSAL.js (`aud=https://ai.azure.com`). Chat App wraps the user's token in a `UserTokenCredential` and calls the Foundry Responses API. The user's identity is preserved for downstream MCP tool calls.
 
-### 2. Foundry → APIM MCP (OAuth Delegated)
+### 2. Foundry → APIM MCP (UserEntraToken)
 
-Foundry Agent uses the `mcp-oauth` RemoteTool connection to acquire a delegated token (`aud=api://{audienceAppId}`, `scp=access_as_user`). APIM validates with `validate-azure-ad-token`. On 401, returns RFC 9728 Protected Resource Metadata.
+Foundry Agent uses the `mcp-entra` RemoteTool connection (authType: `UserEntraToken`) to pass the user's existing Entra token (`aud=https://ai.azure.com`) directly to APIM. APIM validates with `validate-jwt`. No OAuth2 client flow, no consent, no refresh tokens.
 
 ### 3. APIM → Azure OpenAI (Managed Identity)
 
@@ -106,23 +102,21 @@ APIM AI Gateway uses system-assigned MI with `Cognitive Services User` role. No 
 | Token | Audience | Auth Type | User Identity? |
 |-------|----------|-----------|----------------|
 | Browser → Foundry | `https://ai.azure.com` | Delegated (MSAL.js) | Yes |
-| Foundry → APIM MCP | `api://{audienceAppId}` | Delegated (OAuth) | Yes |
+| Foundry → APIM MCP | `https://ai.azure.com` | UserEntraToken passthrough | Yes |
 | APIM → Azure OpenAI | `https://cognitiveservices.azure.com` | Managed Identity | No |
 
 ### Entra App Registrations
 
-All created by postprovision hook (`az` CLI, delegated permissions):
+Created by postprovision hook (`az` CLI, delegated permissions):
 
 | App | Purpose | Key Config |
 |-----|---------|------------|
-| **MCP Gateway Audience** | API that MCP tokens authenticate against | `identifierUris: api://{appId}`, scope `access_as_user` |
-| **Foundry OAuth Client** | OAuth client for Foundry token acquisition | `isFallbackPublicClient: true`, redirect URIs for ApiHub consent |
 | **Chat App SPA** | Browser MSAL.js authentication | SPA redirect URIs, `requiredResourceAccess` for `https://ai.azure.com` |
 
 ## IaC Principle
 
 **Bicep first.** The postprovision hook only handles:
-- **Entra App Registrations** — ARM identity lacks `Application.ReadWrite.All` in managed tenants
+- **Entra App Registration** — ARM identity lacks `Application.ReadWrite.All` in managed tenants
 - **Foundry Agent** — No ARM resource type; SDK only
 
 ## Bicep Deployment Tiers
@@ -139,26 +133,24 @@ All created by postprovision hook (`az` CLI, delegated permissions):
 
 ## Postprovision Hook Steps
 
-1. **Step 1:** Create Entra apps (MCP Gateway Audience + Foundry OAuth Client) + configure OAuth connection
-2. **Step 1b:** Create Chat App Entra registration
-3. **Step 2:** Update APIM Named Value (`McpAudienceAppId`)
-4. **Step 3:** Create Foundry agent (`orders-assistant`) with MCP tool
-5. **Step 4:** Update Chat App container env vars
+1. **Step 1:** Create Chat App Entra registration
+2. **Step 2:** Create Foundry agent (`orders-assistant`) with MCP tool
+3. **Step 3:** Update Chat App container env vars
 
 ## Environment Variables (azd)
 
 Set by Bicep outputs:
-- `AZURE_RESOURCE_GROUP`, `APIM_GATEWAY_URL`, `APIM_MCP_ENDPOINT`, `AI_FOUNDRY_PROJECT_ENDPOINT`, `COGNITIVE_ACCOUNT_NAME`, `AI_FOUNDRY_PROJECT_NAME`, `MCP_OAUTH_CONNECTION_NAME`
+- `AZURE_RESOURCE_GROUP`, `APIM_GATEWAY_URL`, `APIM_MCP_ENDPOINT`, `AI_FOUNDRY_PROJECT_ENDPOINT`, `COGNITIVE_ACCOUNT_NAME`, `AI_FOUNDRY_PROJECT_NAME`, `MCP_CONNECTION_NAME`
 
 Set by postprovision hook:
-- `MCP_AUDIENCE_APP_ID`, `MCP_OAUTH_CLIENT_ID`, `MCP_OAUTH_CLIENT_SECRET`, `CHAT_APP_ENTRA_CLIENT_ID`
+- `CHAT_APP_ENTRA_CLIENT_ID`
 
 ## Development Notes
 
 - **Platform:** Windows 11 + Git Bash
 - **Python:** Use `python` not `python3` (Windows)
 - **MSYS path fix:** `export MSYS_NO_PATHCONV=1` before `az` commands with resource ID paths
-- **Foundry SDK:** `azure-ai-projects` v2 beta — `MCPTool` with `project_connection_id` for OAuth
+- **Foundry SDK:** `azure-ai-projects` v2 beta — `MCPTool` with `project_connection_id` for UserEntraToken
 - **Agent name:** `orders-assistant`
 - **MCP server_label:** Must match `^[a-zA-Z0-9_]+$` (no hyphens)
 - **gpt-4o required** — other models do NOT support MCP tools

@@ -4,13 +4,20 @@
         <set-header name="X-Request-ID" exists-action="skip">
             <value>@(context.RequestId.ToString())</value>
         </set-header>
-        <validate-azure-ad-token tenant-id="{{McpTenantId}}"
+        <validate-jwt header-name="Authorization"
             failed-validation-httpcode="401"
-            failed-validation-error-message="Unauthorized">
+            failed-validation-error-message="Unauthorized"
+            require-scheme="Bearer"
+            output-token-variable-name="jwt">
+            <openid-config url="https://login.microsoftonline.com/{{McpTenantId}}/v2.0/.well-known/openid-configuration" />
             <audiences>
-                <audience>{{McpAudienceAppId}}</audience>
+                <audience>https://ai.azure.com</audience>
             </audiences>
-        </validate-azure-ad-token>
+            <issuers>
+                <issuer>https://login.microsoftonline.com/{{McpTenantId}}/v2.0</issuer>
+                <issuer>https://sts.windows.net/{{McpTenantId}}/</issuer>
+            </issuers>
+        </validate-jwt>
     </inbound>
     <backend>
         <base />

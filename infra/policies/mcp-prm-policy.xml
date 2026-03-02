@@ -16,7 +16,7 @@
                     },
                     bearer_methods_supported = new[] { "header" },
                     scopes_supported = new[] {
-                        "{{McpAudienceAppId}}/access_as_user"
+                        "https://ai.azure.com/.default"
                     }
                 });
             }</set-body>

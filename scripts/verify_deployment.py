@@ -1,15 +1,15 @@
-"""Deployment verification for Identity Propagation PoC (Phase 1.5).
+"""Deployment verification for Identity Propagation PoC.
 
 Validates every deployed resource and proves end-to-end data flow:
 Agent -> APIM MCP -> Orders API.
 
 Layers:
   1. Infrastructure — 20 checks (Bicep resources via ARM API)
-  2. Post-Provision — 2 checks  (hook-created resources)
-  2.5. OAuth        — 9 checks  (Entra apps + OAuth connection + APIM Named Values + sign-in audit)
+  2. Post-Provision — 3 checks  (hook-created resources)
+  2.5. Connection   — 3 checks  (UserEntraToken connection + APIM Named Values)
   3. Functional     — 6 checks  (HTTP + MCP 401 + PRM + agent round-trip)
 
-Total: 37 checks
+Total: 32 checks
 
 Usage:
   python scripts/verify_deployment.py
@@ -406,7 +406,6 @@ def check_apim_openai_operations():
 
 def check_cognitive_role_assignment():
     sub_id = os.environ.get("AZURE_SUBSCRIPTION_ID", az("account show").get("id", ""))
-    # List role assignments on the cognitive account scoped to Cognitive Services User
     url = (
         f"https://management.azure.com/subscriptions/{sub_id}"
         f"/resourceGroups/{RESOURCE_GROUP}"
@@ -434,7 +433,6 @@ def check_cognitive_role_assignment():
 
 def check_ai_gateway_connection():
     sub_id = os.environ.get("AZURE_SUBSCRIPTION_ID", az("account show").get("id", ""))
-    # Check at project level (project-scoped connection)
     url = (
         f"https://management.azure.com/subscriptions/{sub_id}"
         f"/resourceGroups/{RESOURCE_GROUP}"
@@ -449,7 +447,6 @@ def check_ai_gateway_connection():
     props = conn.get("properties", {})
     category = props.get("category", "")
     auth_type = props.get("authType", "")
-    target = props.get("target", "")
     if category == "ApiManagement" and auth_type == "AAD":
         record("infra", True, f"AI Gateway Connection (project-level, category={category}, auth={auth_type})")
     else:
@@ -463,7 +460,6 @@ def check_ai_gateway_proxy():
         return
     url = f"{gateway}/openai/deployments/gpt-4o/chat/completions?api-version=2024-10-21"
     status, _ = http_get(url)
-    # Expect 401 or 403 — proves the route exists and auth is required
     if status in (401, 403):
         record("func", True, f"AI Gateway Proxy (HTTP {status} — route exists, auth required)")
     elif status == 0:
@@ -505,7 +501,6 @@ def check_mcp_api():
 def check_foundry_agent():
     project_endpoint = os.environ.get("AI_FOUNDRY_PROJECT_ENDPOINT", "")
     if not project_endpoint:
-        # Try to construct it
         project_endpoint = f"https://{COGNITIVE_ACCOUNT}.services.ai.azure.com/api/projects/{PROJECT_NAME}"
 
     try:
@@ -519,7 +514,6 @@ def check_foundry_agent():
         credential = DefaultAzureCredential()
         client = AIProjectClient(endpoint=project_endpoint, credential=credential)
 
-        # v2 SDK: agents.list() returns agent summaries
         agents = list(client.agents.list())
 
         found = None
@@ -559,9 +553,9 @@ def check_foundry_agent():
         else:
             record("postprov", False, f"Foundry Agent — model={model}, has_mcp={has_mcp}")
 
-        # Check MCP tool has OAuth connection (conditional)
-        oauth_connection = os.environ.get("MCP_OAUTH_CONNECTION_NAME", "")
-        if oauth_connection:
+        # Check MCP tool has connection
+        mcp_connection = os.environ.get("MCP_CONNECTION_NAME", "")
+        if mcp_connection:
             mcp_tool = None
             for t in tools:
                 t_type = t.get("type") if isinstance(t, dict) else getattr(t, "type", "")
@@ -570,27 +564,23 @@ def check_foundry_agent():
                     break
             if mcp_tool:
                 conn_id = mcp_tool.get("project_connection_id") if isinstance(mcp_tool, dict) else getattr(mcp_tool, "project_connection_id", "")
-                if conn_id == oauth_connection:
-                    record("oauth", True, f"Agent MCP tool has OAuth connection ({conn_id})")
+                if conn_id == mcp_connection:
+                    record("conn", True, f"Agent MCP tool has connection ({conn_id})")
                 else:
-                    record("oauth", False, f"Agent MCP tool connection — expected '{oauth_connection}', got '{conn_id}'")
+                    record("conn", False, f"Agent MCP tool connection — expected '{mcp_connection}', got '{conn_id}'")
             else:
-                record("oauth", False, "Agent MCP tool — no MCP tool found on agent")
+                record("conn", False, "Agent MCP tool — no MCP tool found on agent")
 
     except Exception as e:
         record("postprov", False, f"Foundry Agent — error: {e}")
 
 
-# ─── Layer 2.5: OAuth (conditional — only if MCP_OAUTH_CLIENT_ID is set) ─────
+# ─── Layer 2.5: Connection (UserEntraToken) ───────────────────────────────────
 
 def check_apim_named_values():
-    """Verify all 3 MCP-related Named Values exist and are not placeholders."""
+    """Verify MCP-related Named Values exist (McpTenantId + APIMGatewayURL)."""
     sub_id = os.environ.get("AZURE_SUBSCRIPTION_ID", az("account show").get("id", ""))
-    expected = {
-        "McpTenantId": None,         # any non-empty value
-        "McpAudienceAppId": None,    # must not be placeholder
-        "APIMGatewayURL": None,      # any non-empty value
-    }
+    expected = ["McpTenantId", "APIMGatewayURL"]
     all_ok = True
     for nv_name in expected:
         url = (
@@ -601,17 +591,16 @@ def check_apim_named_values():
         )
         nv = az_rest("get", url)
         if not nv:
-            record("oauth", False, f"APIM Named Value '{nv_name}' — not found")
+            record("conn", False, f"APIM Named Value '{nv_name}' — not found")
             all_ok = False
             continue
         value = nv.get("properties", {}).get("value", "")
         if not value or value == "placeholder-updated-by-hook":
-            record("oauth", False, f"APIM Named Value '{nv_name}' — placeholder or empty")
+            record("conn", False, f"APIM Named Value '{nv_name}' — placeholder or empty")
             all_ok = False
         else:
-            # Truncate display for readability
             display = value[:40] + "..." if len(value) > 40 else value
-            record("oauth", True, f"APIM Named Value '{nv_name}' = {display}")
+            record("conn", True, f"APIM Named Value '{nv_name}' = {display}")
     return all_ok
 
 
@@ -647,7 +636,6 @@ def check_prm_endpoint():
     except json.JSONDecodeError:
         record("func", False, "PRM endpoint — invalid JSON response")
         return
-    # Validate required RFC 9728 fields
     resource = data.get("resource", "")
     auth_servers = data.get("authorization_servers", [])
     scopes = data.get("scopes_supported", [])
@@ -664,9 +652,10 @@ def check_prm_endpoint():
         record("func", False, f"PRM endpoint — missing fields: {', '.join(missing)}")
 
 
-def check_oauth_connection_exists():
+def check_entra_connection_exists():
+    """Check the UserEntraToken MCP connection exists with correct authType."""
     sub_id = os.environ.get("AZURE_SUBSCRIPTION_ID", az("account show").get("id", ""))
-    conn_name = os.environ.get("MCP_OAUTH_CONNECTION_NAME", "mcp-oauth")
+    conn_name = os.environ.get("MCP_CONNECTION_NAME", "mcp-entra")
     url = (
         f"https://management.azure.com/subscriptions/{sub_id}"
         f"/resourceGroups/{RESOURCE_GROUP}"
@@ -676,99 +665,23 @@ def check_oauth_connection_exists():
     )
     conn = az_rest("get", url)
     if not conn:
-        record("oauth", False, f"MCP OAuth Connection ({conn_name}) — not found")
-        return None
-    record("oauth", True, f"MCP OAuth Connection ({conn_name}) exists")
-    return conn
-
-
-def check_oauth_connection_auth_type(conn: dict):
+        record("conn", False, f"MCP Connection ({conn_name}) — not found")
+        return
     props = conn.get("properties", {})
     auth_type = props.get("authType", "")
-    if auth_type == "OAuth2":
-        record("oauth", True, f"OAuth connection authType={auth_type}")
+    if auth_type == "UserEntraToken":
+        record("conn", True, f"MCP Connection ({conn_name}, authType={auth_type})")
     else:
-        record("oauth", False, f"OAuth connection authType — expected 'OAuth2', got '{auth_type}'")
+        record("conn", False, f"MCP Connection ({conn_name}) — expected authType 'UserEntraToken', got '{auth_type}'")
 
 
-def check_oauth_connection_target(conn: dict):
-    props = conn.get("properties", {})
-    target = props.get("target", "")
-    mcp_endpoint = os.environ.get("APIM_MCP_ENDPOINT", "")
-    if mcp_endpoint and target == mcp_endpoint:
-        record("oauth", True, f"OAuth connection target matches MCP endpoint")
-    elif target:
-        record("oauth", True, f"OAuth connection target={target}")
-    else:
-        record("oauth", False, "OAuth connection target — empty")
-
-
-def check_oauth_connection_scopes(conn: dict):
-    props = conn.get("properties", {})
-    scopes = props.get("scopes", [])
-    audience_app_id = os.environ.get("MCP_AUDIENCE_APP_ID", "")
-    expected_scope = f"api://{audience_app_id}/access_as_user" if audience_app_id else ""
-    if expected_scope and expected_scope in scopes:
-        record("oauth", True, f"OAuth connection scopes include audience app")
-    elif scopes:
-        record("oauth", True, f"OAuth connection scopes={scopes}")
-    else:
-        record("oauth", False, "OAuth connection scopes — empty")
-
-
-def check_signin_audit_logs():
-    """Query Graph auditLogs/signIns for recent OAuth client sign-in events."""
-    oauth_client_id = os.environ.get("MCP_OAUTH_CLIENT_ID", "")
-    if not oauth_client_id:
-        record("oauth", False, "Sign-in audit — MCP_OAUTH_CLIENT_ID not set")
-        return
-    url = (
-        "https://graph.microsoft.com/v1.0/auditLogs/signIns"
-        f"?$filter=appId eq '{oauth_client_id}'"
-        "&$top=5&$orderby=createdDateTime desc"
-        "&$select=createdDateTime,userDisplayName,status"
-    )
-    cmd = f'az rest --method get --url "{url}" -o json'
-    result = subprocess.run(
-        cmd, capture_output=True, text=True, shell=True,
-        env={**os.environ, "MSYS_NO_PATHCONV": "1"},
-    )
-    if result.returncode != 0:
-        stderr = result.stderr or ""
-        if "Authorization_RequestDenied" in stderr or "Insufficient privileges" in stderr:
-            # Soft pass — permission not available but not a deployment issue
-            record("oauth", True, "Sign-in audit — skipped (AuditLog.Read.All not granted, run check-signin-logs.py with privileged account)")
-            return
-        if "InvalidAuthenticationToken" in stderr:
-            record("oauth", True, "Sign-in audit — skipped (az login token expired)")
-            return
-        record("oauth", False, f"Sign-in audit — Graph API error: {stderr[:120]}")
-        return
-    try:
-        data = json.loads(result.stdout)
-    except json.JSONDecodeError:
-        record("oauth", False, "Sign-in audit — invalid JSON from Graph API")
-        return
-    events = data.get("value", [])
-    if events:
-        latest = events[0]
-        ts = latest.get("createdDateTime", "?")[:19]
-        user = latest.get("userDisplayName", "?")
-        error_code = latest.get("status", {}).get("errorCode", -1)
-        status = "success" if error_code == 0 else f"AADSTS{error_code}"
-        record("oauth", True, f"Sign-in audit — {len(events)} recent event(s), latest: {ts} by {user} ({status})")
-    else:
-        record("oauth", True, "Sign-in audit — no recent sign-in events (normal if unused)")
-
-
-# ─── Layer 3: Functional (3 checks) ──────────────────────────────────────────
+# ─── Layer 3: Functional (6 checks) ──────────────────────────────────────────
 
 def get_orders_api_url() -> str:
     """Get the direct Orders API URL from env or Container App FQDN."""
     url = os.environ.get("ORDERS_API_URL", "")
     if url:
         return url.rstrip("/")
-    # Fall back to az lookup
     app = az(f'containerapp show --name {CONTAINER_APP} -g {RESOURCE_GROUP}')
     if app:
         fqdn = app.get("properties", {}).get("configuration", {}).get("ingress", {}).get("fqdn", "")
@@ -851,7 +764,6 @@ def check_agent_roundtrip():
         credential = DefaultAzureCredential()
         client = AIProjectClient(endpoint=project_endpoint, credential=credential)
 
-        # v2 SDK: find orders-assistant (may have version suffix)
         agents = list(client.agents.list())
         agent = None
         for a in agents:
@@ -867,7 +779,6 @@ def check_agent_roundtrip():
 
         agent_name = getattr(agent, "name", "orders-assistant")
 
-        # Run agent via Responses API
         print(f"    Running agent '{agent_name}' via Responses API (this may take 30-60s)...")
         openai_client = client.get_openai_client()
         conversation = openai_client.conversations.create()
@@ -878,25 +789,9 @@ def check_agent_roundtrip():
             extra_body={"agent_reference": {"name": agent_name, "type": "agent_reference"}},
         )
 
-        # Inspect all output items for OAuth consent or MCP approval requests
         output_items = getattr(response, "output", [])
         output_types = [getattr(item, "type", "unknown") for item in output_items]
         print(f"    Response output types: {output_types}")
-
-        # Check for oauth_consent_request (OAuth identity passthrough)
-        consent_items = [
-            item for item in output_items
-            if getattr(item, "type", "") == "oauth_consent_request"
-        ]
-        if consent_items:
-            consent_link = getattr(consent_items[0], "consent_link", "")
-            record("func", True,
-                f"Agent OAuth consent requested — multi-turn flow needed. "
-                f"Run: python scripts/test-agent-oauth.py")
-            if consent_link:
-                print(f"    Consent link: {consent_link[:100]}...")
-            openai_client.close()
-            return
 
         # Check for mcp_approval_request (tool approval)
         approval_items = [
@@ -906,7 +801,7 @@ def check_agent_roundtrip():
         if approval_items:
             record("func", True,
                 f"Agent MCP approval requested ({len(approval_items)} tool(s)). "
-                f"Run: python scripts/test-agent-oauth.py")
+                f"Run: python scripts/test-agent.py")
             openai_client.close()
             return
 
@@ -914,7 +809,6 @@ def check_agent_roundtrip():
         openai_client.close()
 
         if not response_text:
-            # Dump output items for debugging
             for item in output_items:
                 item_type = getattr(item, "type", "unknown")
                 print(f"    Output item: type={item_type}")
@@ -924,7 +818,6 @@ def check_agent_roundtrip():
             record("func", False, "Agent round-trip — no output text in response")
             return
 
-        # Check for seed data markers
         found_markers = [m for m in DATA_MARKERS if m in response_text]
         count = len(found_markers)
         if count >= 3:
@@ -956,7 +849,7 @@ def init_globals():
 LAYER_LABELS = {
     "infra": "Layer 1: Infrastructure",
     "postprov": "Layer 2: Post-Provision",
-    "oauth": "Layer 2.5: OAuth",
+    "conn": "Layer 2.5: Connection",
     "func": "Layer 3: Functional",
 }
 
@@ -1003,16 +896,10 @@ def main():
     check_mcp_api()
     check_foundry_agent()
 
-    # --- Layer 2.5: OAuth (9 checks) ---
-    # Entra apps are always deployed via Bicep (Microsoft.Graph extension)
-    print(f"\n=== {LAYER_LABELS['oauth']} (9 checks) ===")
+    # --- Layer 2.5: Connection (3 checks) ---
+    print(f"\n=== {LAYER_LABELS['conn']} (3 checks) ===")
     check_apim_named_values()
-    conn = check_oauth_connection_exists()
-    if conn:
-        check_oauth_connection_auth_type(conn)
-        check_oauth_connection_target(conn)
-        check_oauth_connection_scopes(conn)
-    check_signin_audit_logs()
+    check_entra_connection_exists()
     # Agent project_connection_id check is handled inside check_foundry_agent()
 
     # --- Layer 3: Functional (6 checks) ---
@@ -1049,6 +936,6 @@ def main():
 if __name__ == "__main__":
     argparse.ArgumentParser(
         description="Deployment verification for Identity Propagation PoC. "
-        "Runs 37 checks across infra, post-provision, OAuth, and functional layers."
+        "Runs 32 checks across infra, post-provision, connection, and functional layers."
     ).parse_args()
     main()

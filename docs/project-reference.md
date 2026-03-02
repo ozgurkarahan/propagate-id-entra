@@ -6,7 +6,7 @@ This document contains project-specific technical details for the Identity Propa
 
 Always prioritize Bicep for Azure resource creation. The post-provision hook (`hooks/postprovision.py`) is only for:
 - **Foundry Agent** — no ARM resource type; SDK only
-- **Entra App Registrations** — Graph Bicep extension requires `Application.ReadWrite.All` on the ARM deployment identity, which is unavailable in managed tenants. Created via `az` CLI (delegated permissions) in the hook instead.
+- **Chat App Entra Registration** — Graph Bicep extension requires `Application.ReadWrite.All` on the ARM deployment identity, which is unavailable in managed tenants. Created via `az` CLI (delegated permissions) in the hook instead.
 
 The APIM MCP Server is deployed via Bicep using `@2025-03-01-preview`. BCP037 warnings are expected and safe to ignore.
 
@@ -26,7 +26,7 @@ The APIM MCP Server is deployed via Bicep using `@2025-03-01-preview`. BCP037 wa
 - Agent creation: `project_client.agents.create_version()` with `PromptAgentDefinition` + `MCPTool`
 - Agent execution: `project_client.get_openai_client()` → `openai_client.responses.create()` (Responses API)
 - `MCPTool` class: `server_label`, `server_url`, `require_approval`, `allowed_tools`, `project_connection_id`
-- `project_connection_id` — references the Foundry project connection name (e.g., `mcp-oauth`)
+- `project_connection_id` — references the Foundry project connection name (e.g., `mcp-entra`)
 - `server_label` must match `^[a-zA-Z0-9_]+$` — no hyphens
 - `gpt-4o` required — other models do NOT support MCP tools
 - Responses API uses `extra_body={"agent_reference": {"name": agent.name, "type": "agent_reference"}}` to bind agent (the `"agent"` key is deprecated — returns 400 `invalid_payload`)
@@ -40,45 +40,39 @@ The APIM MCP Server is deployed via Bicep using `@2025-03-01-preview`. BCP037 wa
 - BCP037 warnings for `apiType`, `type`, `mcpTools` — expected and safe to ignore
 - MCP endpoint: `{gateway_url}/{api_path}/mcp`
 
-### Entra App Registrations (Postprovision Hook)
+### Entra App Registration (Postprovision Hook)
 
 - **Created by postprovision hook** (`hooks/postprovision.py`) using `az` CLI with delegated permissions
-- Graph Bicep extension (`infra/modules/entra-apps.bicep`) exists but is unused — ARM deployment identity lacks `Application.ReadWrite.All` in managed tenants
-- Hook creates: MCP Gateway Audience app (with `access_as_user` scope), Foundry OAuth Client app (with redirect URI + API permission), service principals, admin consent grant
-- Hook also sets: `identifierUris` (`api://{appId}`), client secret, updates OAuth connection with real credentials
+- ARM deployment identity lacks `Application.ReadWrite.All` in managed tenants
+- Hook creates: Chat App SPA app (with `requiredResourceAccess` for `https://ai.azure.com`), service principal
 - Idempotent — checks by `displayName` before creating; PATCH operations are safe to re-run
-- `MCP_AUDIENCE_APP_ID` and `MCP_OAUTH_CLIENT_ID` are set by hook via `azd env set` (not Bicep outputs)
+- `CHAT_APP_ENTRA_CLIENT_ID` is set by hook via `azd env set` (not Bicep output)
 
-### MCP OAuth Connection
+### MCP UserEntraToken Connection
 
-- **Always deployed** — Bicep creates the connection with placeholder values; hook patches with real credentials
-- OAuth2 connection on Foundry project: `mcp-oauth-connection.bicep` using `@2025-04-01-preview`
-- Connection category: `RemoteTool` with `group: 'GenericProtocol'` and `metadata.type: 'custom_MCP'`
-- **IMPORTANT:** `CustomKeys` with `authType: OAuth2` is NOT recognized by Agent Service for OAuth — must use `RemoteTool`
-- **IMPORTANT:** Bicep-created RemoteTool connections do NOT register the ApiHub connector — postprovision hook must DELETE the Bicep connection and PUT a fresh one via ARM REST to trigger ApiHub setup
-- BCP037 warnings for `group`, `connectorName`, `metadata.type`, `credentials`, `authorizationUrl`, `tokenUrl`, `refreshUrl`, `scopes` — expected and safe to ignore
-- Bicep deploys with placeholder secret (`newGuid()`); postprovision hook updates with real secret
-- Agent MCP tool: `MCPTool(project_connection_id=...)` references the OAuth connection
-- **Consent:** Foundry uses ApiHub (`consent.azure-apihub.net`) for interactive OAuth — multi-turn flow with `oauth_consent_request` → user authenticates → `previous_response_id` to continue
-- **Fallback:** `scripts/grant-mcp-consent.py` — device code flow → stores refresh token on connection via ARM REST PUT
-- **Re-deployment note:** each `azd up` creates a new client secret — re-run `test-agent-oauth.py` after each deploy
+- **Deployed via Bicep** — `mcp-oauth-connection.bicep` using `@2025-04-01-preview` with `authType: 'UserEntraToken'`
+- Connection name: `mcp-entra` (category: `RemoteTool`, metadata.type: `custom_MCP`)
+- Passes the user's existing Entra token (`aud=https://ai.azure.com`) directly to APIM
+- **No OAuth2 client flow** — no consent prompts, no refresh tokens, no ApiHub involvement
+- **No client secrets** — no credentials to manage or rotate
+- Agent MCP tool: `MCPTool(project_connection_id='mcp-entra')` references the connection
+- BCP037 warnings for `metadata.type` — expected and safe to ignore
 
 ### MCP Auth (APIM Token Validation)
 
-- APIM `validate-azure-ad-token` policy on MCP API (`infra/policies/mcp-api-policy.xml`)
-- Validates JWT: `aud` = `api://{audienceAppId}`, issuer = `https://sts.windows.net/{tenantId}/`
+- APIM `validate-jwt` policy on MCP API (`infra/policies/mcp-api-policy.xml`)
+- Validates JWT: `aud` = `https://ai.azure.com`, issuers = v1 (`https://sts.windows.net/{tenantId}/`) + v2 (`https://login.microsoftonline.com/{tenantId}/v2.0`)
 - Returns 401 with `WWW-Authenticate` challenge on invalid/missing token
 - RFC 9728 Protected Resource Metadata at `/.well-known/oauth-protected-resource` (`infra/policies/mcp-prm-policy.xml`)
-- 3 APIM Named Values: `McpTenantId`, `McpAudienceAppId` (placeholder → hook patches), `APIMGatewayURL`
+- 2 APIM Named Values: `McpTenantId`, `APIMGatewayURL`
 - App Insights confirms: `auth.type: bearer-token` with full JWT, user identity propagated
 
 ### Scripts
 
-- `scripts/verify_deployment.py` — 37-check deployment verification (ARM API + OAuth + Named Values + MCP 401 + PRM + sign-in audit + agent round-trip)
-- `scripts/diagnose-mcp-auth.py` — 8-step MCP OAuth diagnostic (24/24 checks)
-- `scripts/test-agent-oauth.py` — Interactive multi-turn agent test (OAuth consent + MCP approval)
-- `scripts/grant-mcp-consent.py` — Fallback device code flow for OAuth consent
-- `scripts/check-signin-logs.py` — Entra ID sign-in log viewer (Graph API `auditLogs/signIns` for all 3 app registrations)
+- `scripts/verify_deployment.py` — 32-check deployment verification (ARM API + connection + MCP 401 + PRM + agent round-trip)
+- `scripts/diagnose-mcp-auth.py` — MCP auth diagnostic (connection + endpoint checks)
+- `scripts/test-agent.py` — Interactive agent test (MCP tool approval)
+- `scripts/check-signin-logs.py` — Entra ID sign-in log viewer (Graph API `auditLogs/signIns`)
 
 ### APIM Diagnostics (MCP Compatibility)
 
@@ -88,7 +82,7 @@ The APIM MCP Server is deployed via Bicep using `@2025-03-01-preview`. BCP037 wa
 - Request body logging (8192 bytes) is fine — only response body logging causes issues
 - Also: do NOT access `context.Response.Body` in MCP API policies — triggers response buffering that breaks SSE (per MS docs)
 
-### Chat App (Phase 3)
+### Chat App
 
 - `src/chat-app/` — FastAPI backend + vanilla JS SPA with MSAL.js
 - MSAL.js loaded from CDN: `https://alcdn.msauth.net/browser/2.38.2/js/msal-browser.min.js`
@@ -100,9 +94,7 @@ The APIM MCP Server is deployed via Bicep using `@2025-03-01-preview`. BCP037 wa
 - **Access token**: sent in `Authorization: Bearer` header (not POST body)
 - **Timeout**: `responses.create()` calls wrapped in `asyncio.wait_for(..., timeout=120)` — returns 504 on timeout
 - SPA Entra app needs `requiredResourceAccess` for `https://ai.azure.com` — without it, AADSTS650057
-- Postprovision hook creates Chat App Entra registration (Step 1b) + updates container env vars (Step 4)
-- **Re-authenticate flow:** When MCP tokens expire, frontend detects auth errors (401/`tool_user_error`) and shows a red "Re-authenticate" banner. Clicking it calls `POST /api/reset-mcp-auth` which DELETE+PUTs the MCP connection via ARM REST (managed identity with `Cognitive Services Contributor` role), wiping ApiHub's stale token state. The retry triggers `oauth_consent_request` → existing consent banner handles the rest.
-- **Connection config env vars:** Postprovision hook sets `AZURE_SUBSCRIPTION_ID`, `AZURE_RESOURCE_GROUP`, `COGNITIVE_ACCOUNT_NAME`, `AI_FOUNDRY_PROJECT_NAME`, `APIM_GATEWAY_URL`, `MCP_OAUTH_CLIENT_ID`, `MCP_OAUTH_CLIENT_SECRET` on the chat app container — needed by `/api/reset-mcp-auth`
+- Postprovision hook creates Chat App Entra registration (Step 1) + updates container env vars (Step 3)
 
 ### Observability
 
@@ -113,8 +105,6 @@ The APIM MCP Server is deployed via Bicep using `@2025-03-01-preview`. BCP037 wa
 - **Foundry agent telemetry**: `responsesapi` cloud role emits AI dependency records (LLM calls + MCP tool executions) to App Insights automatically — connected via Foundry portal Tracing page (NOT via Bicep — `appInsightsResourceId` does not exist in the CognitiveServices ARM schema)
 - **Foundry SDK is opaque**: no custom headers/trace context possible — correlate via timestamps + user identity across the boundary
 - **Workbook**: `infra/workbooks/identity-propagation.json` — 8 tabs (traces, tokens, auth failures, MCP patterns, E2E flow, container logs, errors, OAuth audit)
-- **Sign-in audit logs**: Entra ID `auditLogs/signIns` (Graph API) shows token issuance events for all 3 app registrations — fills the Foundry/ApiHub OAuth visibility gap
-- **Entra diagnostic settings constraint**: Routing sign-in logs to Log Analytics requires Security Admin role (blocked in managed tenants). Use `check-signin-logs.py` as immediate alternative.
 - **`APPLICATIONINSIGHTS_CONNECTION_STRING`**: injected via Bicep env var on all Container Apps (Chat App, Orders API)
 
 ### APIM MCP Write Operations (Known Issue)
@@ -129,7 +119,6 @@ The APIM MCP Server is deployed via Bicep using `@2025-03-01-preview`. BCP037 wa
 - After `azd down --purge`, do NOT recreate CognitiveServices with the same name — data plane caching causes "Project not found" errors. Use `azd env set COGNITIVE_ACCOUNT_SUFFIX 2` (or next available suffix)
 - Managed tenant forces `disableLocalAuth: true` even if Bicep sets `false`
 - `Cognitive Services User` role assignment needed on the account for AAD auth
-- Identifier URI format: managed tenant requires `api://{appId}` — not custom names
 - Entra app registration changes can take 1-5 minutes to propagate — new `requiredResourceAccess` may not be immediately available
 - **CRITICAL — azd parameter mapping:** `main.parameters.json` must explicitly map azd env vars to Bicep parameters using `"${VAR_NAME}"` syntax. azd does NOT auto-map env vars to Bicep params. Missing mappings cause Bicep params to use their empty-string defaults silently, which can break containers at runtime)
 - **CRITICAL — `az containerapp update` + Bicep placeholder images:** Container Apps deployed with a Bicep placeholder image (e.g., `containerapps-helloworld:latest`) then updated by `azd deploy` with the real image — if you later run `az containerapp update --set-env-vars`, the new revision inherits the Bicep placeholder image, NOT the azd-deployed image. Always include `--image <real-image>` when using `az containerapp update`.

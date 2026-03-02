@@ -3,7 +3,7 @@
 Endpoints:
   GET  /health           — Health check
   GET  /api/config       — MSAL config (from env vars, no hardcoded values)
-  POST /api/chat         — Send message to agent (handles multi-turn OAuth/MCP flow)
+  POST /api/chat         — Send message to agent (handles multi-turn MCP flow)
   POST /api/chat/approve — Approve MCP tool calls
   GET  /                 — Static SPA (index.html)
 """
@@ -12,8 +12,6 @@ import asyncio
 import logging
 import os
 import uuid
-
-import httpx
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -87,8 +85,6 @@ def _parse_output_items(output_items):
     result = {
         "type": "text",
         "text": "",
-        "consent_required": False,
-        "consent_link": None,
         "approval_required": False,
         "approval_ids": [],
     }
@@ -96,12 +92,7 @@ def _parse_output_items(output_items):
     for item in output_items:
         item_type = getattr(item, "type", "unknown")
 
-        if item_type == "oauth_consent_request":
-            result["type"] = "consent_required"
-            result["consent_required"] = True
-            result["consent_link"] = getattr(item, "consent_link", "")
-
-        elif item_type == "mcp_approval_request":
+        if item_type == "mcp_approval_request":
             result["type"] = "approval_required"
             result["approval_required"] = True
             result["approval_ids"].append({
@@ -154,8 +145,8 @@ async def chat(request: Request):
     """Send a message to the Foundry agent.
 
     Handles the multi-turn Responses API flow:
-    - First call: sends user message, may get oauth_consent_request
-    - After consent: resend with previous_response_id to continue
+    - First call: sends user message, may get mcp_approval_request
+    - After approval: resend with previous_response_id to continue
     """
     body = await request.json()
     access_token = body.get("access_token")
@@ -197,7 +188,7 @@ async def chat(request: Request):
         # Log any tool-related items for debugging (errors, mcp_list_changed, etc.)
         for item in output_items:
             item_type = getattr(item, "type", "unknown")
-            if item_type not in ("message", "oauth_consent_request", "mcp_approval_request"):
+            if item_type not in ("message", "mcp_approval_request"):
                 logger.info(
                     "chat_output_item request_id=%s type=%s item=%s",
                     request_id, item_type, str(item)[:500],
@@ -297,98 +288,6 @@ async def chat_approve(request: Request):
         raise HTTPException(status_code=502, detail=str(e))
     finally:
         openai_client.close()
-
-
-# ---------------------------------------------------------------------------
-# MCP connection reset (re-authentication)
-# ---------------------------------------------------------------------------
-
-def _build_mcp_oauth_body():
-    """Build ARM PUT body for the mcp-oauth connection."""
-    client_id = os.environ.get("MCP_OAUTH_CLIENT_ID", "")
-    client_secret = os.environ.get("MCP_OAUTH_CLIENT_SECRET", "")
-    audience_app_id = os.environ.get("MCP_AUDIENCE_APP_ID", "")
-    tenant_id = os.environ.get("TENANT_ID", "")
-    apim_gateway = os.environ.get("APIM_GATEWAY_URL", "")
-
-    if not all([client_id, client_secret, audience_app_id, tenant_id, apim_gateway]):
-        return None
-
-    return {
-        "properties": {
-            "authType": "OAuth2",
-            "category": "RemoteTool",
-            "group": "GenericProtocol",
-            "connectorName": "mcp-oauth",
-            "target": f"{apim_gateway}/orders-mcp/mcp",
-            "credentials": {
-                "clientId": client_id,
-                "clientSecret": client_secret,
-            },
-            "authorizationUrl": f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/authorize",
-            "tokenUrl": f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token",
-            "refreshUrl": f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token",
-            "scopes": [f"api://{audience_app_id}/access_as_user"],
-            "metadata": {"type": "custom_MCP"},
-            "isSharedToAll": True,
-        }
-    }
-
-
-@app.post("/api/reset-mcp-auth")
-async def reset_mcp_auth(request: Request):
-    """Reset MCP OAuth connections to force re-authentication.
-
-    DELETE+PUT both connections to wipe ApiHub's stale token state.
-    Next Foundry request will return oauth_consent_request.
-    """
-    body = await request.json()
-    access_token = body.get("access_token")
-    if not access_token:
-        raise HTTPException(status_code=401, detail="access_token required")
-
-    sub_id = os.environ.get("AZURE_SUBSCRIPTION_ID", "")
-    rg = os.environ.get("AZURE_RESOURCE_GROUP", "")
-    account = os.environ.get("COGNITIVE_ACCOUNT_NAME", "")
-    project = os.environ.get("AI_FOUNDRY_PROJECT_NAME", "")
-
-    if not all([sub_id, rg, account, project]):
-        raise HTTPException(status_code=500, detail="Missing ARM configuration env vars")
-
-    # Get ARM token via managed identity
-    from azure.identity import DefaultAzureCredential
-    credential = DefaultAzureCredential()
-    arm_token = credential.get_token("https://management.azure.com/.default")
-
-    base_url = (
-        f"https://management.azure.com/subscriptions/{sub_id}"
-        f"/resourceGroups/{rg}"
-        f"/providers/Microsoft.CognitiveServices/accounts/{account}"
-        f"/projects/{project}/connections"
-    )
-    api_version = "2025-04-01-preview"
-    headers = {
-        "Authorization": f"Bearer {arm_token.token}",
-        "Content-Type": "application/json",
-    }
-
-    reset_connections = []
-
-    async with httpx.AsyncClient(timeout=30) as client:
-        # Reset mcp-oauth connection
-        mcp_body = _build_mcp_oauth_body()
-        if mcp_body:
-            url = f"{base_url}/mcp-oauth?api-version={api_version}"
-            await client.delete(url, headers=headers)
-            resp = await client.put(url, headers=headers, json=mcp_body)
-            if resp.status_code in (200, 201):
-                reset_connections.append("mcp-oauth")
-                logger.info("Reset mcp-oauth connection")
-            else:
-                logger.warning("Failed to reset mcp-oauth: %s %s", resp.status_code, resp.text[:200])
-
-    logger.info("MCP auth reset complete: %s", reset_connections)
-    return {"status": "reset", "connections": reset_connections}
 
 
 # ---------------------------------------------------------------------------

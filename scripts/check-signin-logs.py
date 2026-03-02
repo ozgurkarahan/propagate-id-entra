@@ -1,13 +1,7 @@
 """Entra ID sign-in log viewer for Identity Propagation PoC.
 
-Queries Microsoft Graph API `auditLogs/signIns` to show OAuth token issuance
-events for the 3 Entra app registrations used in this PoC:
-  - MCP Gateway Audience app
-  - Foundry OAuth Client app
-  - Chat App SPA
-
-This provides visibility into the Foundry/ApiHub OAuth pipeline that is
-otherwise opaque in our own telemetry.
+Queries Microsoft Graph API `auditLogs/signIns` to show token issuance
+events for the Chat App SPA Entra app registration.
 
 Requirements:
   - `az login` with a user that has `AuditLog.Read.All` delegated permission
@@ -16,7 +10,6 @@ Requirements:
 Usage:
   python scripts/check-signin-logs.py
   python scripts/check-signin-logs.py --hours 48
-  python scripts/check-signin-logs.py --app-filter mcp-oauth
   python scripts/check-signin-logs.py --app-filter all --hours 72
 """
 
@@ -114,14 +107,8 @@ def graph_get(url: str):
 def get_app_ids() -> dict:
     """Return mapping of filter name to (app_id, display_name)."""
     apps = {}
-    audience_id = os.environ.get("MCP_AUDIENCE_APP_ID", "")
-    oauth_id = os.environ.get("MCP_OAUTH_CLIENT_ID", "")
     chat_id = os.environ.get("CHAT_APP_ENTRA_CLIENT_ID", "")
 
-    if audience_id:
-        apps["audience"] = (audience_id, "MCP Gateway Audience")
-    if oauth_id:
-        apps["mcp-oauth"] = (oauth_id, "Foundry OAuth Client")
     if chat_id:
         apps["chat-spa"] = (chat_id, "Chat App SPA")
 
@@ -218,7 +205,7 @@ def main():
         help="How many hours back to query (default: 24)"
     )
     parser.add_argument(
-        "--app-filter", choices=["audience", "mcp-oauth", "chat-spa", "all"],
+        "--app-filter", choices=["chat-spa", "all"],
         default="all",
         help="Which app registration to filter (default: all)"
     )
@@ -233,8 +220,8 @@ def main():
     apps = get_app_ids()
     if not apps:
         print(f"{RED}ERROR:{RESET} No app IDs found in azd environment.")
-        print("  Set MCP_AUDIENCE_APP_ID, MCP_OAUTH_CLIENT_ID, or CHAT_APP_ENTRA_CLIENT_ID")
-        print("  Run: azd env get-values | grep -E 'MCP_|CHAT_APP'")
+        print("  Set CHAT_APP_ENTRA_CLIENT_ID")
+        print("  Run: azd env get-values | grep CHAT_APP")
         sys.exit(1)
 
     # Filter apps
