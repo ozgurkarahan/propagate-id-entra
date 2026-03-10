@@ -1,60 +1,83 @@
 # Propagate ID Entra
 
-End-to-end identity propagation from users through AI agents to backend APIs in Azure — deployed with **Azure Developer CLI (`azd`)** and **Bicep**.
+**End-to-end identity propagation from browser through AI agents to backend APIs — no service accounts in the data path.**
+
+[![azd compatible](https://img.shields.io/badge/azd-compatible-blue)](https://learn.microsoft.com/azure/developer/azure-developer-cli/)
+[![Python 3.12](https://img.shields.io/badge/python-3.12-blue)](https://www.python.org/)
+[![Bicep IaC](https://img.shields.io/badge/IaC-Bicep-orange)](https://learn.microsoft.com/azure/azure-resource-manager/bicep/)
+[![MIT License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
+> A proof-of-concept showing how a user's Entra ID token can flow from a browser, through an AI Foundry agent with MCP tools, through API Management, all the way to a backend API — preserving the caller's identity at every hop. Deployed with a single `azd up`.
 
 ## Architecture
 
-```
-Browser (MSAL.js)
-        │  Sign in → Entra ID → access token
-        │  POST /api/chat { message, access_token }
-        ▼
-┌─────────────────────┐
-│  Chat App (FastAPI)  │  Container App: ca-chat-app
-│  UserTokenCredential │  Port 8080
-│  Responses API (v2)  │
-└────────┬────────────┘
-         │  openai_client.responses.create()
-         ▼
-┌─────────────────────┐
-│  AI Foundry Agent   │
-│  (gpt-4o)           │
-└────────┬────────────┘
-         │
-         │ Orders MCP (UserEntraToken)
-         ▼
-┌──────────────────────────────────────────────────┐
-│  API Management (APIM)                            │
-│  ├─ Orders MCP API  (/orders-mcp)                 │
-│  ├─ Orders REST API (/orders-api)                 │
-│  └─ Azure OpenAI API (/openai)                    │
-└────────┬─────────────────────────────────────────┘
-         │
-         ▼
-┌──────────────────┐
-│  Orders API      │
-│  (Container App) │
-│  FastAPI · 6 CRUD│
-└──────────────────┘
+```mermaid
+flowchart TD
+    Browser["Browser<br/>(MSAL.js SPA)"]
+    Entra["Entra ID"]
+    ChatApp["Chat App<br/>(FastAPI + Container App)"]
+    Agent["AI Foundry Agent<br/>(gpt-4o)"]
+    APIM["API Management"]
+    MCP["/orders-mcp<br/>validate-jwt"]
+    REST["/orders-api"]
+    OAI["/openai<br/>AI Gateway"]
+    Orders["Orders API<br/>(FastAPI + Container App)"]
+    AOI["Azure OpenAI"]
+
+    Browser -- "1 Sign in" --> Entra
+    Entra -- "access token" --> Browser
+    Browser -- "2 POST /api/chat<br/>{message, token}" --> ChatApp
+    ChatApp -- "3 Responses API<br/>(UserTokenCredential)" --> Agent
+    Agent -- "4 MCP tool call<br/>(UserEntraToken)" --> APIM
+    APIM --- MCP
+    APIM --- REST
+    APIM --- OAI
+    MCP --> Orders
+    REST --> Orders
+    OAI -- "Managed Identity" --> AOI
 ```
 
-An AI Foundry agent uses an **MCP tool** to call the Orders API through APIM. The user's Entra token is passed directly via a **UserEntraToken** connection — no OAuth2 client flow, no consent prompts, no refresh token expiry. APIM also serves as an **AI Gateway** — proxying Azure OpenAI with managed identity auth, token rate limiting, and token metrics.
+## How Identity Flows
 
-## Resource Overview
+```mermaid
+sequenceDiagram
+    participant B as Browser
+    participant E as Entra ID
+    participant C as Chat App
+    participant F as Foundry Agent
+    participant A as APIM
+    participant O as Orders API
 
-| Resource | Name Pattern | Purpose |
-|----------|--------------|---------|
-| AI Services Account | `aoai-{env}` | Foundry project + gpt-4o deployment |
-| API Management | `apim-{env}` | Gateway — REST, MCP, and OpenAI APIs |
-| Container App | `ca-orders-api` | FastAPI Orders API |
-| Container App | `ca-chat-app` | Chat frontend + Foundry agent bridge |
-| Monitor Workbook | `identity-propagation` | Observability dashboard |
-| Container Registry | `acr{env}*` | Docker image hosting |
-| Log Analytics + App Insights | `log-{env}` / `appi-{env}` | Monitoring and token metrics |
-| Key Vault | `kv-{env}` | Secrets (future) |
-| Storage Account | `st{env}*` | Storage (future) |
+    B->>E: Sign in (MSAL.js)
+    E-->>B: Access token (aud=ai.azure.com)
+    B->>C: POST /api/chat {message, access_token}
+    Note over C: Wraps token in<br/>UserTokenCredential
+    C->>F: responses.create()
+    Note over F: Agent decides to<br/>call MCP tool
+    F->>A: MCP request + Bearer token<br/>(UserEntraToken passthrough)
+    Note over A: validate-jwt<br/>(aud, issuer, signature)
+    A->>O: Forward request + JWT claims
+    O-->>A: Order data
+    A-->>F: MCP response
+    F-->>C: Agent response
+    C-->>B: Chat reply
+```
 
-## Prerequisites
+| Hop | Auth Type | User Identity Preserved? |
+|-----|-----------|--------------------------|
+| Browser → Chat App → Foundry | Delegated (MSAL.js access token) | Yes |
+| Foundry → APIM MCP | UserEntraToken passthrough | Yes |
+| APIM → Azure OpenAI | Managed Identity (service-to-service) | No |
+
+> [!IMPORTANT]
+> No OAuth2 client credentials, no consent prompts, no client secrets, no refresh token expiry. The user's existing Entra token is passed directly at every hop via a **UserEntraToken** connection.
+
+## Quick Start
+
+> [!TIP]
+> `azd up` does everything: provisions Azure resources via Bicep, builds and deploys containers to ACR, then runs a post-provision hook to create the Entra app registration and Foundry agent.
+
+### Prerequisites
 
 - **Azure subscription** with Owner/Contributor access
 - **Azure CLI** (`az`) — logged in
@@ -62,161 +85,61 @@ An AI Foundry agent uses an **MCP tool** to call the Orders API through APIM. Th
 - **Python** 3.9+
 - **Git**
 
-Docker is not required locally — builds run remotely on ACR.
+Docker is not required locally — container builds run remotely on ACR.
 
-## Quick Start
+### Deploy
 
 ```bash
-# Clone and enter the repo
 git clone https://github.com/ozgurkarahan/propagate-id-entra.git
 cd propagate-id-entra
-
-# Create an azd environment
 azd env new propagate-id-entra
-
-# Deploy everything (infra + app + post-provision hook)
 azd up
+```
 
-# Verify the deployment
+### Verify
+
+```bash
 python scripts/verify_deployment.py
-
-# Test agent interactively
 python scripts/test-agent.py
 ```
 
-`azd up` runs Bicep provisioning, builds and deploys the Orders API and Chat App containers, then executes the post-provision hook to create the Chat App Entra registration and the Foundry agent.
+## What `azd up` Does
+
+```mermaid
+flowchart LR
+    P["azd provision"]
+    D["azd deploy"]
+    H["postprovision hook"]
+
+    P -- "Bicep modules<br/>(13 modules, 4 tiers)" --> D
+    D -- "Build + deploy<br/>Orders API & Chat App" --> H
+    H -- "1. Entra app registration<br/>2. Foundry agent creation<br/>3. Chat App env vars" --> Done["Ready"]
+```
 
 ## Project Structure
 
-```
-├── azure.yaml                    # azd project manifest
-├── AGENT.md                      # Architecture, auth flow diagrams
-├── requirements.txt              # Python dependencies (hook + scripts)
-├── infra/
-│   ├── main.bicep                # Orchestrator (subscription-scoped)
-│   ├── main.parameters.json      # Parameters (azd env vars)
-│   ├── policies/
-│   │   ├── ai-gateway-policy.xml    # APIM OpenAI proxy policy
-│   │   ├── mcp-api-policy.xml       # validate-jwt + 401 challenge
-│   │   └── mcp-prm-policy.xml       # RFC 9728 Protected Resource Metadata
-│   └── modules/
-│       ├── cognitive.bicep          # AI Services + Project + gpt-4o
-│       ├── container-app.bicep      # Container Apps Environment + App
-│       ├── apim.bicep               # APIM + REST & OpenAI APIs
-│       ├── apim-mcp.bicep           # APIM MCP Server (native)
-│       ├── registry.bicep           # Container Registry
-│       ├── monitoring.bicep         # Log Analytics + App Insights
-│       ├── chat-app.bicep           # Chat App Container App
-│       ├── workbook.bicep           # Azure Monitor Workbook
-│       ├── role-assignment.bicep    # Cognitive Services User → APIM MI
-│       ├── ai-gateway-connection.bicep
-│       ├── mcp-oauth-connection.bicep  # UserEntraToken MCP connection
-│       ├── storage.bicep            # (future)
-│       └── keyvault.bicep           # (future)
-├── infra/workbooks/
-│   └── identity-propagation.json # Workbook KQL
-├── src/orders-api/
-│   ├── app.py                    # FastAPI endpoints
-│   ├── data.py                   # In-memory order store (8 seed orders)
-│   ├── Dockerfile                # Python 3.12-slim, non-root
-│   └── requirements.txt
-├── src/chat-app/
-│   ├── app.py                    # FastAPI backend (MSAL → Foundry bridge)
-│   ├── static/index.html         # SPA chat UI with MSAL.js
-│   ├── static/style.css          # Chat styling
-│   ├── static/app.js             # MSAL auth + chat logic
-│   ├── Dockerfile                # Python 3.12-slim, port 8080
-│   └── requirements.txt
-├── hooks/
-│   ├── postprovision.sh          # Shell wrapper (installs deps, calls .py)
-│   └── postprovision.py          # Chat App Entra registration + Foundry agent
-├── scripts/
-│   ├── verify_deployment.py          # Deployment verification
-│   ├── diagnose-mcp-auth.py          # MCP auth diagnostic
-│   ├── test-agent.py                 # Interactive agent test
-│   ├── check-signin-logs.py          # Entra sign-in log viewer (Graph API)
-│   └── generate_resource_inventory.py
-└── docs/
-    ├── deep-dive.md              # ARM resources, data flows, step-by-step
-    ├── identity-security.md      # Identity & security architecture
-    ├── project-reference.md      # Technical reference
-    └── lessons-learned.md        # Workflow lessons
-```
+<details>
+<summary>Click to expand</summary>
 
-## Orders API
+| Path | Description |
+|------|-------------|
+| `infra/main.bicep` | Subscription-scoped Bicep orchestrator |
+| `infra/modules/` | 13 Bicep modules (APIM, Cognitive, Container Apps, etc.) |
+| `infra/policies/` | APIM policies (JWT validation, AI Gateway, RFC 9728 PRM) |
+| `src/orders-api/` | FastAPI Orders CRUD backend (6 endpoints, 8 seed orders) |
+| `src/chat-app/` | FastAPI backend + vanilla JS SPA with MSAL.js |
+| `hooks/postprovision.py` | Entra app registration + Foundry agent creation |
+| `scripts/` | Deployment verification, diagnostics, agent testing |
+| `docs/` | Deep-dive architecture, identity & security, reference docs |
 
-Six CRUD endpoints running on Azure Container Apps:
+</details>
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/health` | Health check |
-| `GET` | `/orders` | List all orders |
-| `GET` | `/orders/{id}` | Get order by ID |
-| `POST` | `/orders` | Create order |
-| `PUT` | `/orders/{id}` | Update order |
-| `DELETE` | `/orders/{id}` | Delete order |
+## Learn More
 
-The API ships with 8 seed orders (ORD-001 through ORD-008) stored in memory.
-
-## Bicep Deployment Tiers
-
-Modules deploy in dependency order:
-
-| Tier | Modules | Depends On |
-|------|---------|------------|
-| 1 | cognitive, registry, monitoring, storage, keyvault | — |
-| 1.5 | workbook | monitoring |
-| 2 | container-app | registry, monitoring |
-| 2.5 | chat-app | registry, container-app, cognitive |
-| 3 | apim | container-app, cognitive |
-| 3.5 | apim-mcp | apim |
-| 4 | role-assignment, chat-app-role, ai-gateway-connection, mcp-oauth-connection | cognitive, apim-mcp, chat-app |
-
-## IaC Principle
-
-**Bicep first** — every resource Bicep can create is defined in Bicep. The post-provision hook handles only what Bicep cannot deploy:
-
-- **Entra App Registration** — ARM deployment identity lacks `Application.ReadWrite.All` in managed tenants; the hook uses `az ad app` with delegated permissions instead.
-- **Foundry Agent** — No ARM resource type exists; created via the `azure-ai-projects` SDK.
-
-## Scripts
-
-| Script | Purpose |
-|--------|---------|
-| `scripts/verify_deployment.py` | Deployment verification across infra, post-provision, connection, and functional layers |
-| `scripts/diagnose-mcp-auth.py` | MCP auth diagnostic — endpoint and connection checks |
-| `scripts/test-agent.py` | Interactive agent test with MCP tool approval |
-| `scripts/check-signin-logs.py` | Query Entra ID sign-in logs (Graph API) |
-| `scripts/generate_resource_inventory.py` | Query ARM APIs and generate a resource inventory document |
-
-## Observability
-
-All tiers emit telemetry to a shared Application Insights instance:
-
-- **Browser**: App Insights JS SDK tracks page views, sign-in events, chat responses, and exceptions
-- **Chat App / Orders API**: `azure-monitor-opentelemetry` auto-instruments HTTP requests, exceptions, and structured logging
-- **APIM**: Gateway logs with 100% sampling; response body logging disabled (breaks MCP SSE streaming)
-- **Foundry Agent**: `responsesapi` cloud role emits AI dependency records (LLM calls + MCP tool executions) — connected via Foundry portal Tracing page
-- **Correlation IDs**: `session_id` (browser), `request_id` (chat-app), `X-Request-ID` (APIM → Orders API), `Mcp-Session-Id` (MCP protocol)
-
-The Azure Monitor Workbook (`infra/workbooks/identity-propagation.json`) provides tabs covering identity propagation traces, token metrics, auth failures, MCP request patterns, E2E request flow, container app logs, errors dashboard, and OAuth audit.
-
-## Deployment Notes
-
-| Issue | Workaround |
-|-------|------------|
-| CognitiveServices name reuse after purge | `azd env set COGNITIVE_ACCOUNT_SUFFIX 2` (increment for each purge) |
-| Windows charmap errors in ACR build | `az acr build --no-logs` |
-| MSYS path conversion in Git Bash | `export MSYS_NO_PATHCONV=1` before `az` commands with resource ID paths |
-| Managed tenant blocks local auth | All connections use `authType: 'AAD'` or `UserEntraToken` |
-
-## Documentation
-
-- [`AGENT.md`](AGENT.md) — Architecture, auth flow diagrams, dependency chain
-- [`docs/identity-security.md`](docs/identity-security.md) — Identity & security architecture: Entra app registration, managed identities, auth flows, APIM JWT validation with RFC 9728 Protected Resource Metadata, security design decisions, and configuration reference
-- [`docs/deep-dive.md`](docs/deep-dive.md) — ARM resource details, step-by-step build guide, data flows
-- [`docs/project-reference.md`](docs/project-reference.md) — Technical reference for development
+- [**Identity & Security Architecture**](docs/identity-security.md) — Entra app registration, managed identities, JWT validation, RFC 9728, security design decisions
+- [**Deep Dive**](docs/deep-dive.md) — ARM resource details, data flows, step-by-step build guide
+- [**AGENT.md**](AGENT.md) — Architecture diagrams, auth flow details, IaC principles, development reference
 
 ## License
 
-This project is a proof of concept for educational and demonstration purposes.
+[MIT](LICENSE)
